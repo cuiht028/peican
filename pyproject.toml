@@ -1,0 +1,20 @@
+[project]
+name = "peican"
+version = "1.1.0"
+description = "家庭四季养生配餐 - 智能配餐应用"
+requires-python = ">=3.10"
+dependencies = [
+    "flet>=0.21.0",
+]
+
+[tool.flet]
+org = "com.qclaw"
+project = "peican"
+product = "家庭四季养生配餐"
+company = "QCLaw"
+copyright = "Copyright (C) 2026 QCLaw. All rights reserved."
+
+[tool.flet.android]
+feature = []
+permission = []
+meta_data = []
