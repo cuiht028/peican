@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# Flet / Flutter build artifacts
+.flet/
+build/
+*.apk
+*.aab
+*.ipa
+
+# Database (运行时生成，不入库)
+meal.db
+*.db-journal
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+/tmp/
