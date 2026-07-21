@@ -1,0 +1,54 @@
+%% 一键配餐流程（改造后）
+sequenceDiagram
+    participant U as 用户
+    participant H as home_page
+    participant DS as diner_select_page
+    participant MS as member_service
+    participant MP as meal_planner
+    participant R as result_page
+
+    U->>H: 点击「今日一键配餐」
+    H->>DS: page.go("/diner_select")
+    DS->>MS: list_members()
+    MS-->>DS: members[]
+    DS->>MS: load_diner_selection()
+    MS-->>DS: last_selection (或空)
+    DS->>U: 渲染成员列表+餐次开关(默认上次)
+    U->>DS: 勾选成员+餐次，点「确认配餐」
+    DS->>MS: save_diner_selection(selection)
+    DS->>MS: build_plan_from_selection(members, selection)
+    MS-->>DS: plan dict
+    DS->>MP: generate_daily_meals(today, region, plan)
+    Note over MP: 按 headcount 查表<br/>0人餐次跳过
+    MP-->>DS: result dict
+    DS->>H: store_plan(result, plan)
+    DS->>R: page.go("/result")
+    R->>U: 展示配餐结果
+
+%% 宴请配餐流程
+sequenceDiagram
+    participant U as 用户
+    participant H as home_page
+    participant B as banquet_page
+    participant MS as member_service
+    participant MP as meal_planner
+    participant R as result_page
+
+    U->>H: 点击「家庭宴请配餐」
+    H->>B: page.go("/banquet")
+    B->>MS: list_members()
+    MS-->>B: members[]
+    B->>MS: load_banquet_selection()
+    MS-->>B: last_banquet (或空)
+    B->>U: 渲染成员复选+访客输入+餐次
+    U->>B: 选成员+输入访客数+选餐次，点「开始配餐」
+    B->>MS: save_banquet_selection(data)
+    B->>MS: build_banquet_plan(members, ids, adults, children, elderly, meal)
+    Note over MS: 构造虚拟访客 dict<br/>plan["banquet"]=True
+    MS-->>B: plan dict
+    B->>MP: generate_daily_meals(today, region, plan)
+    Note over MP: banquet=True →<br/>每餐+1荤菜
+    MP-->>B: result dict
+    B->>H: store_plan(result, plan)
+    B->>R: page.go("/result")
+    R->>U: 展示宴请配餐结果
