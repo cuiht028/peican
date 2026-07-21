@@ -182,7 +182,7 @@ def banquet_page(page: ft.Page) -> ft.View:
             theme.text("访客人数", theme.SUBTITLE_TEXT,
                        color=theme.COLOR_PRIMARY, weight=ft.FontWeight.BOLD),
             ft.Container(height=8),
-            ft.Row([guest_adults, guest_children, guest_elderly]),
+            ft.Row([guest_adults, guest_children, guest_elderly], wrap=True),
             ft.Container(height=16),
             theme.text("餐次选择", theme.SUBTITLE_TEXT,
                        color=theme.COLOR_PRIMARY, weight=ft.FontWeight.BOLD),
@@ -190,7 +190,7 @@ def banquet_page(page: ft.Page) -> ft.View:
             meal_radio,
             ft.Container(height=20),
             theme.big_button("开始配餐", icon=ft.Icons.RESTAURANT_MENU,
-                             on_click=_on_start, width=400),
+                             on_click=_on_start),
         ],
         scroll=ft.ScrollMode.AUTO,
     )

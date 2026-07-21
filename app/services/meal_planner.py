@@ -1,20 +1,15 @@
 """核心配餐算法引擎（每日三餐）。
 
-严格按 PRD 2.4 / 2.5 优先级实现「数据驱动、非随机、可复现」的配餐：
-  ① 忌口兜底剔除 → ② 特殊体质优先 → ③ 年龄适配 → ④ 口味折中
-  → ⑤ 地域匹配 → ⑥ 节气加分 → ⑦ 按 day_of_year 确定性轮转选菜。
-
-设计原则：
-  * 纯函数、无状态，相同 (成员 + 日期) 输入结果稳定可复现。
-  * 服务层统一返回 dict，空场景返回空结构而非 None。
-
-遵循 Google Python 风格指南。
+本模块基于成员忌口、健康需求、地域、节气和近期生成记录提供可复现的
+三餐推荐。它不修改数据库 schema；近期多样性记录仅保存在进程内，因此不
+会将临时推荐结果写入用户数据。
 """
 
 from __future__ import annotations
 
-from datetime import date
-from typing import Optional
+from datetime import date, timedelta
+import hashlib
+from typing import Any, Optional
 
 from app import config
 from app.database import DB
@@ -22,64 +17,79 @@ from app.models.dish import DishMain
 from app.services.env_service import detect
 from app.services.member_service import build_today_plan
 
+# 最近生成的每日方案。key 为日期，value 为完整 meals dict。仅用于同一进程内
+# 的连续推荐去重，既不改变数据库，也不会影响相同日期的稳定结果。
+_RECENT_MEAL_HISTORY: dict[date, dict[str, list[dict[str, Any]]]] = {}
+_HISTORY_WINDOW_DAYS: int = 14
+_HISTORY_MAX_DATES: int = 45
 
-def _load_dishes(region: int) -> list[dict]:
-    """读取匹配地域的菜品池（region 或通用 2）。"""
-    rows = DB.query(
+# 早餐不适合出现的重油、重辣或大份主菜关键词。关键词只用作安全兜底；口味
+# 等级仍是主要判定依据，避免依赖不可靠的自由文本标签。
+_BREAKFAST_HEAVY_TOKENS: tuple[str, ...] = (
+    "毛血旺", "冒菜", "肥肠鱼", "肥肠", "水煮", "辣子", "麻辣", "香辣",
+    "回锅", "红烧肉", "粉蒸", "烧白", "烤鸭", "卤拼", "油焖", "郡肝",
+)
+_BREAKFAST_PORRIDGE_TOKENS: tuple[str, ...] = ("粥", "羹", "豆花")
+_BREAKFAST_GRAIN_TOKENS: tuple[str, ...] = (
+    "粗粮", "小米", "玉米", "荞麦", "高粱", "红薯", "紫米", "薏米",
+)
+_BREAKFAST_SMALL_DISH_TOKENS: tuple[str, ...] = ("凉拌", "小菜", "豆腐", "青菜", "白菜")
+_AROMATIC_INGREDIENTS: set[str] = {
+    "葱", "大蒜", "蒜", "生姜", "花椒", "红辣椒", "干辣椒", "泡椒",
+    "酱油", "醋", "白糖", "郫县豆瓣", "辣椒油", "盐",
+}
+
+
+def _load_dishes(region: int) -> list[dict[str, Any]]:
+    """读取匹配地域的菜品池（指定地域或通用地域）。"""
+    rows: list[dict[str, Any]] = DB.query(
         "SELECT * FROM dish_main WHERE region_type = ? OR region_type = 2 "
         "ORDER BY id ASC",
         [region],
     )
-    dishes = []
-    for r in rows:
-        d = DishMain.from_row(r).to_dict()
-        dishes.append(d)
-    return dishes
+    return [DishMain.from_row(row).to_dict() for row in rows]
 
 
-def _load_veg_map() -> dict:
-    """食材名 -> 是否素食（0/1）。"""
-    rows = DB.query("SELECT name, is_vegetarian FROM ingredient")
-    return {r["name"]: int(r["is_vegetarian"]) for r in rows}
+def _load_veg_map() -> dict[str, int]:
+    """读取食材名到是否素食的映射。"""
+    rows: list[dict[str, Any]] = DB.query("SELECT name, is_vegetarian FROM ingredient")
+    return {str(row["name"]): int(row["is_vegetarian"]) for row in rows}
 
 
-def _build_constraints(dining: list[dict], rule: dict) -> dict:
-    """聚合一餐的约束集合。"""
-    forbidden_items: set = set(rule.get("forbid_food", []) or [])
-    avoid_cats: set = set()
-    is_vegetarian = False
-    health_needs: set = set()
-    present_ages: set = set()
-    taste_sum = {d: 0 for d in config.TASTE_DIMS}
-    taste_cnt = 0
+def _build_constraints(dining: list[dict[str, Any]], rule: dict[str, Any]) -> dict[str, Any]:
+    """聚合一餐的忌口、年龄、健康和口味约束。"""
+    forbidden_items: set[str] = set(rule.get("forbid_food", []) or [])
+    avoid_categories: set[str] = set()
+    is_vegetarian: bool = False
+    health_needs: set[str] = set()
+    present_ages: set[int] = set()
+    taste_sum: dict[str, int] = {dimension: 0 for dimension in config.TASTE_DIMS}
+    taste_count: int = 0
 
-    for m in dining:
-        avoid = m.get("avoid_food", {}) or {}
-        for it in avoid.get("items", []) or []:
-            forbidden_items.add(it)
-        for c in avoid.get("categories", []) or []:
-            avoid_cats.add(c)
-        if avoid.get("vegetarian"):
-            is_vegetarian = True
-        for h in m.get("health_tag", []) or []:
-            health_needs.add(h)
-        present_ages.add(m.get("age_type", 4))
-        taste = m.get("taste", {}) or {}
-        for d in config.TASTE_DIMS:
-            taste_sum[d] += int(taste.get(d, config.BASE_TASTE[d]))
-        taste_cnt += 1
+    for member in dining:
+        avoid_food: dict[str, Any] = member.get("avoid_food", {}) or {}
+        forbidden_items.update(avoid_food.get("items", []) or [])
+        avoid_categories.update(avoid_food.get("categories", []) or [])
+        is_vegetarian = is_vegetarian or bool(avoid_food.get("vegetarian", False))
+        health_needs.update(member.get("health_tag", []) or [])
+        present_ages.add(int(member.get("age_type", 4)))
+        taste: dict[str, Any] = member.get("taste", {}) or {}
+        for dimension in config.TASTE_DIMS:
+            taste_sum[dimension] += int(taste.get(dimension, config.BASE_TASTE[dimension]))
+        taste_count += 1
 
-    if taste_cnt > 0:
+    taste_target: dict[str, int]
+    if taste_count:
         taste_target = {
-            d: max(1, min(4, round(taste_sum[d] / taste_cnt)))
-            for d in config.TASTE_DIMS
+            dimension: max(1, min(4, round(taste_sum[dimension] / taste_count)))
+            for dimension in config.TASTE_DIMS
         }
     else:
         taste_target = dict(config.BASE_TASTE)
 
     return {
         "forbidden_items": forbidden_items,
-        "avoid_cats": avoid_cats,
+        "avoid_categories": avoid_categories,
         "is_vegetarian": is_vegetarian,
         "health_needs": health_needs,
         "present_ages": present_ages,
@@ -87,188 +97,431 @@ def _build_constraints(dining: list[dict], rule: dict) -> dict:
     }
 
 
-def _hard_eliminate(dish: dict, ctx: dict, veg_map: dict, strict: bool) -> bool:
-    """硬剔除判定。strict=True 时包含体质 / 年龄剔除。
+def _ingredient_names(dish: dict[str, Any]) -> set[str]:
+    """返回菜品主材名称集合，容忍旧数据中的不完整食材条目。"""
+    ingredients: list[dict[str, Any]] = dish.get("main_ingredients", []) or []
+    return {
+        str(ingredient.get("name", ""))
+        for ingredient in ingredients
+        if ingredient.get("name")
+    }
 
-    Returns:
-        True 表示应剔除。
+
+def _primary_ingredients(dish: dict[str, Any]) -> set[str]:
+    """返回用于同餐去重的主要食材，忽略调味料。"""
+    return _ingredient_names(dish) - _AROMATIC_INGREDIENTS
+
+
+def _hard_eliminate(
+    dish: dict[str, Any],
+    constraints: dict[str, Any],
+    veg_map: dict[str, int],
+    strict: bool,
+) -> bool:
+    """判断菜品是否因硬性约束被剔除。
+
+    ``strict=False`` 只放宽年龄和健康适配，绝不放宽用户忌口与素食要求。
     """
-    # ① 忌口：主材命中忌食食材
-    ing_names = {ing["name"] for ing in dish.get("main_ingredients", [])}
-    if ing_names & ctx["forbidden_items"]:
+    ingredient_names: set[str] = _ingredient_names(dish)
+    if ingredient_names & constraints["forbidden_items"]:
         return True
 
-    # 素食冲突
-    if ctx["is_vegetarian"]:
-        if dish["dish_type"] == 3:  # 荤菜整类剔除
+    if constraints["is_vegetarian"]:
+        if int(dish.get("dish_type", 2)) == 3:
             return True
-        if any(veg_map.get(n, 1) == 0 for n in ing_names):
+        if any(veg_map.get(name, 1) == 0 for name in ingredient_names):
             return True
 
     if strict:
-        # ② 特殊体质禁忌
-        if set(dish.get("forbid_health", [])) & ctx["health_needs"]:
+        if set(dish.get("forbid_health", []) or []) & constraints["health_needs"]:
             return True
-        # ③ 年龄禁忌
-        if set(dish.get("forbid_age", [])) & ctx["present_ages"]:
+        if set(dish.get("forbid_age", []) or []) & constraints["present_ages"]:
             return True
     return False
 
 
-def _score_dish(dish: dict, ctx: dict, rule: dict, region: int, meal_key: str) -> int:
-    """计算菜品综合得分（越高越优）。"""
-    score = 0
-    taste = dish.get("taste", {})
-    suit_health = set(dish.get("suit_health", []))
-    suit_age = set(dish.get("suit_age", []))
-    ing_names = {ing["name"] for ing in dish.get("main_ingredients", [])}
+def _is_breakfast_unsuitable(dish: dict[str, Any]) -> bool:
+    """返回早餐是否应排除该菜品。
 
-    # ② 体质匹配加分
-    matched_health = ctx["health_needs"] & suit_health
-    score += min(len(matched_health) * 3, 9)
+    早餐禁止明确列出的重口主菜，并将重辣、重麻菜作为不可选项。轻蛋白菜
+    仍可作为候选不足时的补位，保证菜库较小时能产出完整结果。
+    """
+    dish_name: str = str(dish.get("dish_name", ""))
+    taste: dict[str, Any] = dish.get("taste", {}) or {}
+    if any(token in dish_name for token in _BREAKFAST_HEAVY_TOKENS):
+        return True
+    return int(taste.get("spicy", 2)) >= 3 or int(taste.get("numb", 2)) >= 3
 
-    # ③ 年龄匹配加分
-    matched_age = ctx["present_ages"] & suit_age
-    score += min(len(matched_age) * 2, 8)
 
-    # ④ 口味距离加分（距离越小越好）
-    dist = sum(abs(taste.get(d, 2) - ctx["taste_target"][d]) for d in config.TASTE_DIMS)
-    score += max(0, 16 - dist)
+def _daily_tiebreaker(
+    target_date: date,
+    dish_id: int,
+    meal_key: str,
+    rotation_seed: int = 0,
+) -> int:
+    """为日期、餐次和菜品生成稳定的非随机排序值。"""
+    raw_key: str = f"{target_date.isoformat()}:{meal_key}:{dish_id}:{rotation_seed}"
+    digest: bytes = hashlib.sha256(raw_key.encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], byteorder="big", signed=False)
 
-    # ⑤ 地域匹配
-    if dish["region_type"] == region:
+
+def _history_penalty(dish_id: int, target_date: date) -> int:
+    """计算最近已生成方案的重复惩罚，越近的日期惩罚越高。"""
+    penalty: int = 0
+    lower_bound: date = target_date - timedelta(days=_HISTORY_WINDOW_DAYS)
+    for history_date, meals in _RECENT_MEAL_HISTORY.items():
+        if history_date < lower_bound or history_date >= target_date:
+            continue
+        elapsed_days: int = (target_date - history_date).days
+        for dishes in meals.values():
+            if any(int(item.get("id", 0)) == dish_id for item in dishes):
+                penalty += max(2, 13 - elapsed_days)
+                break
+    return penalty
+
+
+def _breakfast_preference_bonus(dish: dict[str, Any]) -> int:
+    """为粥、粗粮及凉菜/小菜计算早餐优先级加分。"""
+    dish_name: str = str(dish.get("dish_name", ""))
+    ingredient_names: set[str] = _ingredient_names(dish)
+    bonus: int = 0
+    if any(token in dish_name for token in _BREAKFAST_PORRIDGE_TOKENS):
+        bonus += 18
+    if any(token in dish_name for token in _BREAKFAST_GRAIN_TOKENS):
+        bonus += 12
+    if any(token in dish_name for token in _BREAKFAST_SMALL_DISH_TOKENS):
+        bonus += 10
+    if {"鸡蛋", "豆腐", "豆干", "黄豆"} & ingredient_names:
+        bonus += 5
+    if int(dish.get("dish_type", 2)) == 4:
+        bonus += 3
+    return bonus
+
+
+def _score_dish(
+    dish: dict[str, Any],
+    constraints: dict[str, Any],
+    rule: dict[str, Any],
+    region: int,
+    meal_key: str,
+    target_date: date,
+    rotation_seed: int = 0,
+) -> int:
+    """计算菜品综合分，分数越高优先级越高。"""
+    score: int = 0
+    taste: dict[str, Any] = dish.get("taste", {}) or {}
+    suit_health: set[str] = set(dish.get("suit_health", []) or [])
+    suit_age: set[int] = set(dish.get("suit_age", []) or [])
+    ingredient_names: set[str] = _ingredient_names(dish)
+
+    score += min(len(constraints["health_needs"] & suit_health) * 3, 9)
+    score += min(len(constraints["present_ages"] & suit_age) * 2, 8)
+    taste_distance: int = sum(
+        abs(int(taste.get(dimension, 2)) - constraints["taste_target"][dimension])
+        for dimension in config.TASTE_DIMS
+    )
+    score += max(0, 16 - taste_distance)
+
+    if int(dish.get("region_type", 2)) == region:
         score += 5
-    elif dish["region_type"] == 2:
+    elif int(dish.get("region_type", 2)) == 2:
         score += 2
     else:
         score -= 3
 
-    # ⑥ 节气加分
-    term = rule.get("solar_term", "")
-    if term and term in dish.get("suit_solar", []):
-        score += 5
-    rec_food = set(rule.get("recommend_food", []) or [])
-    rec_hit = len(ing_names & rec_food)
-    score += min(rec_hit * 2, 6)
+    solar_term: str = str(rule.get("solar_term", ""))
+    is_solar_match: bool = solar_term in (dish.get("suit_solar", []) or [])
+    if is_solar_match:
+        # 午晚餐优先消化当令菜，早餐保留更强的粥/粗粮偏好。
+        score += 15 if meal_key in ("lunch", "dinner") else 5
+    recommended_food: set[str] = set(rule.get("recommend_food", []) or [])
+    score += min(len(ingredient_names & recommended_food) * 2, 6)
 
-    # 忌口分类软惩罚（香辛类 / 调味类）
-    if "香辛类" in ctx["avoid_cats"] and (taste.get("spicy", 2) >= 3 or taste.get("numb", 2) >= 3):
-        score -= 2
-    if "调味类" in ctx["avoid_cats"] and (taste.get("salt", 2) >= 3 or taste.get("sweet", 2) >= 3):
-        score -= 2
+    if "香辛类" in constraints["avoid_categories"]:
+        if int(taste.get("spicy", 2)) >= 3 or int(taste.get("numb", 2)) >= 3:
+            score -= 2
+    if "调味类" in constraints["avoid_categories"]:
+        if int(taste.get("salt", 2)) >= 3 or int(taste.get("sweet", 2)) >= 3:
+            score -= 2
 
-    # 三餐差异化
     if meal_key == "breakfast":
+        score += _breakfast_preference_bonus(dish)
         if "婴幼儿软烂" in suit_health or "老人养胃" in suit_health:
             score += 3
-        if taste.get("spicy", 2) <= 2 and taste.get("numb", 2) <= 2:
-            score += 2
-    elif meal_key == "lunch":
-        if dish["dish_type"] in (2, 3):
-            score += 1
     elif meal_key == "dinner":
         if "低脂" in suit_health or "老人养胃" in suit_health:
             score += 3
-        if taste.get("spicy", 2) <= 2:
+        if int(taste.get("spicy", 2)) <= 2:
             score += 1
 
+    dish_id: int = int(dish.get("id", 0))
+    score -= _history_penalty(dish_id, target_date)
+    # 日期/轮换 seed 只用于同分候选的稳定排序，绝不覆盖健康和节气权重。
+    del rotation_seed
     return score
 
 
-def _select(pool: list[dict], count: int, offset: int) -> list[dict]:
-    """按综合分降序 + day_of_year 轮转确定性选菜。"""
-    if not pool:
+def _to_scored_candidate(
+    dish: dict[str, Any],
+    constraints: dict[str, Any],
+    rule: dict[str, Any],
+    region: int,
+    meal_key: str,
+    target_date: date,
+    rotation_seed: int = 0,
+) -> dict[str, Any]:
+    """包装菜品及其分数、稳定排序值。"""
+    dish_id: int = int(dish.get("id", 0))
+    return {
+        "dish": dish,
+        "_score": _score_dish(dish, constraints, rule, region, meal_key, target_date, rotation_seed),
+        "id": dish_id,
+        "_rank": _daily_tiebreaker(target_date, dish_id, meal_key, rotation_seed),
+    }
+
+
+def _compatible_with_meal(dish: dict[str, Any], selected: list[dict[str, Any]]) -> bool:
+    """避免同餐重复菜、重复主料及同类菜品堆叠。"""
+    dish_id: int = int(dish.get("id", 0))
+    selected_ids: set[int] = {int(item.get("id", 0)) for item in selected}
+    if dish_id in selected_ids:
+        return False
+
+    candidate_main: set[str] = _primary_ingredients(dish)
+    for selected_dish in selected:
+        if candidate_main & _primary_ingredients(selected_dish):
+            return False
+    return True
+
+
+def _select(
+    pool: list[dict[str, Any]],
+    count: int,
+    offset: int = 0,
+    selected: Optional[list[dict[str, Any]]] = None,
+    excluded_ids: Optional[set[int]] = None,
+) -> list[dict[str, Any]]:
+    """从候选池确定性选菜，并在候选充足时执行同餐多样性约束。
+
+    ``offset`` 保留为兼容旧内部调用；实际排序由日期稳定 hash 决定，不依赖随机。
+    当多样性约束使候选不足时，会自动放宽该软约束，确保菜库较小时仍可配餐。
+    """
+    del offset
+    if count <= 0 or not pool:
         return []
-    pool_sorted = sorted(pool, key=lambda x: (-x["_score"], x["id"]))
-    if len(pool_sorted) <= count:
-        return [p["dish"] for p in pool_sorted]
-    rotated = pool_sorted[offset:] + pool_sorted[:offset]
-    return [p["dish"] for p in rotated[:count]]
+
+    base_selected: list[dict[str, Any]] = list(selected or [])
+    blocked_ids: set[int] = set(excluded_ids or set())
+    ordered: list[dict[str, Any]] = sorted(
+        pool,
+        key=lambda candidate: (-int(candidate["_score"]), int(candidate["_rank"]), int(candidate["id"])),
+    )
+    picked: list[dict[str, Any]] = []
+
+    for candidate in ordered:
+        dish: dict[str, Any] = candidate["dish"]
+        if int(candidate["id"]) in blocked_ids:
+            continue
+        if _compatible_with_meal(dish, base_selected + picked):
+            picked.append(dish)
+        if len(picked) == count:
+            return picked
+
+    # 候选池不足时只放宽「去重」软约束，仍保持所有硬性忌口过滤。
+    used_ids: set[int] = {int(item.get("id", 0)) for item in base_selected + picked}
+    for candidate in ordered:
+        dish: dict[str, Any] = candidate["dish"]
+        dish_id: int = int(candidate["id"])
+        if dish_id in blocked_ids or dish_id in used_ids:
+            continue
+        picked.append(dish)
+        used_ids.add(dish_id)
+        if len(picked) == count:
+            break
+    return picked
+
+
+def _candidate_pool(
+    candidates: list[dict[str, Any]],
+    constraints: dict[str, Any],
+    veg_map: dict[str, int],
+    rule: dict[str, Any],
+    region: int,
+    meal_key: str,
+    target_date: date,
+    count: int,
+    rotation_seed: int = 0,
+) -> list[dict[str, Any]]:
+    """构建严格优先、候选不足时放宽年龄/健康约束的候选池。"""
+    strict_pool: list[dict[str, Any]] = []
+    relaxed_pool: list[dict[str, Any]] = []
+    for dish in candidates:
+        if meal_key == "breakfast" and _is_breakfast_unsuitable(dish):
+            continue
+        if not _hard_eliminate(dish, constraints, veg_map, strict=False):
+            relaxed_pool.append(
+                _to_scored_candidate(dish, constraints, rule, region, meal_key, target_date, rotation_seed)
+            )
+        if not _hard_eliminate(dish, constraints, veg_map, strict=True):
+            strict_pool.append(
+                _to_scored_candidate(dish, constraints, rule, region, meal_key, target_date, rotation_seed)
+            )
+
+    if len(strict_pool) >= count:
+        return strict_pool
+    strict_ids: set[int] = {int(item["id"]) for item in strict_pool}
+    return strict_pool + [item for item in relaxed_pool if int(item["id"]) not in strict_ids]
+
+
+def _is_noodle_staple(dish: dict[str, Any]) -> bool:
+    """判断主食是否为适合午晚餐的一碗式面食/粉类。"""
+    if int(dish.get("dish_type", 0)) != 1:
+        return False
+    dish_name: str = str(dish.get("dish_name", ""))
+    return any(token in dish_name for token in config.NOODLE_STAPLE_TOKENS)
+
+
+def _prefer_lunch_dinner_staples(
+    candidates: list[dict[str, Any]],
+    meal_key: str,
+) -> list[dict[str, Any]]:
+    """午晚餐优先候选中的饺子、面条、粉等面食，候选不足时保持可回退。"""
+    if meal_key not in ("lunch", "dinner"):
+        return candidates
+    noodles: list[dict[str, Any]] = [
+        candidate for candidate in candidates if _is_noodle_staple(candidate["dish"])
+    ]
+    return noodles or candidates
+
+
+def _adjust_structure_for_noodle(
+    structure: dict[int, int],
+    staple: Optional[dict[str, Any]],
+    meal_key: str,
+) -> dict[int, int]:
+    """面食主食自带肉菜或配料时减少配菜，仍保留均衡荤菜/素菜/汤品。"""
+    adjusted: dict[int, int] = dict(structure)
+    if meal_key not in ("lunch", "dinner") or not staple or not _is_noodle_staple(staple):
+        return adjusted
+    # 面食作为一碗主食，至多保留一道素菜；不删荤菜与汤品，避免营养失衡。
+    adjusted[2] = min(int(adjusted.get(2, 0)), 1)
+    return adjusted
+
+
+def _remember_generated_meals(target_date: date, meals: dict[str, list[dict[str, Any]]]) -> None:
+    """保存本次结果并清理过期进程内历史。"""
+    _RECENT_MEAL_HISTORY[target_date] = {
+        meal_key: list(meals.get(meal_key, [])) for meal_key in config.MEAL_KEYS
+    }
+    if len(_RECENT_MEAL_HISTORY) <= _HISTORY_MAX_DATES:
+        return
+    for old_date in sorted(_RECENT_MEAL_HISTORY)[:-_HISTORY_MAX_DATES]:
+        del _RECENT_MEAL_HISTORY[old_date]
 
 
 def generate_daily_meals(
     d: date,
     region: int,
-    plan: Optional[dict] = None,
-) -> dict:
+    plan: Optional[dict[str, Any]] = None,
+    rotation_seed: int = 0,
+    avoid_dish_ids: Optional[set[int]] = None,
+) -> dict[str, Any]:
     """生成每日三餐配餐结果。
 
-    Args:
-        d: 目标日期。
-        region: 地域类型（1 成渝 / 2 其他）。
-        plan: 今日用餐计划（见 build_today_plan）；缺省自动构建。
-
-    Returns:
-        字典：{'term', 'health_tip', 'recommend_food', 'forbid_food',
-              'meals': {'breakfast':[dish_dict], 'lunch':[...], 'dinner':[...]}}。
+    早餐优先粥/粗粮/小菜，并排除重口主菜；同一日的早午晚餐不会重复同一道菜。
+    ``rotation_seed`` 用于同日候选轮换；``avoid_dish_ids`` 用于主动重新配餐时
+    尽量避开上一次整套菜单，且不会放宽忌口、素食等硬性约束。
     """
     if plan is None:
         plan = build_today_plan()
 
-    env = detect(d)
-    rule = {
-        "solar_term": env["solar_term"],
-        "recommend_food": env.get("recommend_food", []),
-        "forbid_food": env.get("forbid_food", []),
+    environment: dict[str, Any] = detect(d)
+    rule: dict[str, Any] = {
+        "solar_term": environment["solar_term"],
+        "recommend_food": environment.get("recommend_food", []),
+        "forbid_food": environment.get("forbid_food", []),
     }
-
-    # 无任何成员用餐时，直接返回空结构（需求：无成员返回空结构，不崩溃）。
-    if all(not plan.get(meal) for meal in config.MEAL_KEYS):
+    empty_meals: dict[str, list[dict[str, Any]]] = {
+        meal_key: [] for meal_key in config.MEAL_KEYS
+    }
+    if all(not plan.get(meal_key) for meal_key in config.MEAL_KEYS):
         return {
-            "term": env["solar_term"],
-            "health_tip": env["health_tip"],
+            "term": environment["solar_term"],
+            "health_tip": environment["health_tip"],
             "recommend_food": rule["recommend_food"],
             "forbid_food": rule["forbid_food"],
-            "meals": {meal: [] for meal in config.MEAL_KEYS},
+            "meals": empty_meals,
         }
 
-    all_dishes = _load_dishes(region)
-    veg_map = _load_veg_map()
-    day_of_year = d.timetuple().tm_yday
-
-    meals_result: dict = {meal: [] for meal in config.MEAL_KEYS}
+    all_dishes: list[dict[str, Any]] = _load_dishes(region)
+    vegetarian_map: dict[str, int] = _load_veg_map()
+    meals_result: dict[str, list[dict[str, Any]]] = {
+        meal_key: [] for meal_key in config.MEAL_KEYS
+    }
+    # 全日已选菜品 ID：保证早餐、午餐、晚餐不会出现同一道菜。
+    selected_day_ids: set[int] = set()
+    # 重配时先排除上一套菜单；若特定餐次候选确实不足，再由下方回退逻辑补位。
+    avoided_ids: set[int] = {int(dish_id) for dish_id in (avoid_dish_ids or set())}
 
     for meal_key in config.MEAL_KEYS:
-        dining = plan.get(meal_key, []) or []
-        ctx = _build_constraints(dining, rule)
+        dining: list[dict[str, Any]] = plan.get(meal_key, []) or []
+        headcount: int = int(plan.get("stats", {}).get(meal_key, {}).get("headcount", 0))
+        if not dining or headcount <= 0:
+            continue
 
-        # V1.1: 按每餐实际用餐人数动态查表确定菜品数量
-        headcount = plan.get("stats", {}).get(meal_key, {}).get("headcount", 0)
-        if headcount == 0:
-            continue  # 0人跳过该餐
-        banquet = plan.get("banquet", False)
-        structure = config.get_meal_structure(headcount, banquet=banquet)[meal_key]
+        constraints: dict[str, Any] = _build_constraints(dining, rule)
+        banquet: bool = bool(plan.get("banquet", False))
+        structure: dict[int, int] = config.get_meal_structure(headcount, banquet=banquet)[meal_key]
+        selected_staple: Optional[dict[str, Any]] = None
 
         for dish_type in (1, 2, 3, 4):
-            count = structure.get(dish_type, 0)
+            count: int = int(structure.get(dish_type, 0))
+            if dish_type != 1:
+                structure = _adjust_structure_for_noodle(structure, selected_staple, meal_key)
+                count = int(structure.get(dish_type, 0))
             if count <= 0:
                 continue
-            candidates = [x for x in all_dishes if x["dish_type"] == dish_type]
-
-            # 严格筛选 + 打分
-            strict_pool = []
-            for dish in candidates:
-                if _hard_eliminate(dish, ctx, veg_map, strict=True):
-                    continue
-                sc = _score_dish(dish, ctx, rule, region, meal_key)
-                strict_pool.append({"dish": dish, "_score": sc, "id": dish["id"]})
-
-            # 兜底：严格池为空时仅按忌口 / 素食放宽
-            pool = strict_pool
-            if not pool:
-                for dish in candidates:
-                    if _hard_eliminate(dish, ctx, veg_map, strict=False):
-                        continue
-                    sc = _score_dish(dish, ctx, rule, region, meal_key)
-                    pool.append({"dish": dish, "_score": sc, "id": dish["id"]})
-
-            offset = day_of_year % max(1, len(pool)) if pool else 0
-            selected = _select(pool, count, offset)
+            candidates: list[dict[str, Any]] = [
+                dish for dish in all_dishes if int(dish.get("dish_type", 0)) == dish_type
+            ]
+            pool: list[dict[str, Any]] = _candidate_pool(
+                candidates,
+                constraints,
+                vegetarian_map,
+                rule,
+                region,
+                meal_key,
+                d,
+                count,
+                rotation_seed,
+            )
+            if dish_type == 1:
+                pool = _prefer_lunch_dinner_staples(pool, meal_key)
+            # 默认严格排除同日已选菜与上次菜单；候选不足时仅允许复用上次菜单，
+            # 绝不允许复用本次已选菜，从而保持跨餐去重。
+            excluded_ids: set[int] = selected_day_ids | avoided_ids
+            selected: list[dict[str, Any]] = _select(
+                pool,
+                count,
+                selected=meals_result[meal_key],
+                excluded_ids=excluded_ids,
+            )
+            if len(selected) < count and avoided_ids:
+                selected = _select(
+                    pool,
+                    count,
+                    selected=meals_result[meal_key],
+                    excluded_ids=selected_day_ids,
+                )
             meals_result[meal_key].extend(selected)
+            selected_day_ids.update(int(dish.get("id", 0)) for dish in selected)
+            if dish_type == 1 and selected:
+                selected_staple = selected[0]
 
+    _remember_generated_meals(d, meals_result)
     return {
-        "term": env["solar_term"],
-        "health_tip": env["health_tip"],
+        "term": environment["solar_term"],
+        "health_tip": environment["health_tip"],
         "recommend_food": rule["recommend_food"],
         "forbid_food": rule["forbid_food"],
         "meals": meals_result,
@@ -278,53 +531,51 @@ def generate_daily_meals(
 def replace_dish(
     d: date,
     region: int,
-    plan: Optional[dict],
+    plan: Optional[dict[str, Any]],
     meal_key: str,
     old_dish_id: int,
-    current_dish_ids: set,
-) -> Optional[dict]:
-    """替换单道菜，返回同类型的新菜品dict（已过忌口筛选），无候选返回None。"""
-    all_dishes = _load_dishes(region)
-    veg_map = _load_veg_map()
+    current_dish_ids: set[int],
+) -> Optional[dict[str, Any]]:
+    """替换单道菜，返回同类型、未在当前结果中使用的新菜品。
 
-    old_dish = next((x for x in all_dishes if x["id"] == old_dish_id), None)
-    if not old_dish:
+    替换同样遵循早餐重口过滤、节气优先和成员硬性忌口；候选不足时只放宽
+    年龄/健康适配，不会放宽忌口或素食限制。
+    """
+    if meal_key not in config.MEAL_KEYS:
         return None
 
-    env = detect(d)
-    rule = {
-        "solar_term": env["solar_term"],
-        "recommend_food": env.get("recommend_food", []),
-        "forbid_food": env.get("forbid_food", []),
+    all_dishes: list[dict[str, Any]] = _load_dishes(region)
+    old_dish: Optional[dict[str, Any]] = next(
+        (dish for dish in all_dishes if int(dish.get("id", 0)) == old_dish_id),
+        None,
+    )
+    if old_dish is None:
+        return None
+
+    environment: dict[str, Any] = detect(d)
+    rule: dict[str, Any] = {
+        "solar_term": environment["solar_term"],
+        "recommend_food": environment.get("recommend_food", []),
+        "forbid_food": environment.get("forbid_food", []),
     }
-    dining = plan.get(meal_key, []) or [] if plan else []
-    ctx = _build_constraints(dining, rule)
-
-    # 严格筛选
-    candidates = []
-    for dish in all_dishes:
-        if dish["dish_type"] != old_dish["dish_type"]:
-            continue
-        if dish["id"] in current_dish_ids:
-            continue
-        if _hard_eliminate(dish, ctx, veg_map, strict=True):
-            continue
-        candidates.append(dish)
-
-    # 兜底放宽
-    if not candidates:
-        for dish in all_dishes:
-            if dish["dish_type"] != old_dish["dish_type"]:
-                continue
-            if dish["id"] in current_dish_ids:
-                continue
-            if _hard_eliminate(dish, ctx, veg_map, strict=False):
-                continue
-            candidates.append(dish)
-
-    if not candidates:
-        return None
-
-    day_of_year = d.timetuple().tm_yday
-    offset = (day_of_year + old_dish_id) % len(candidates)
-    return candidates[offset]
+    dining: list[dict[str, Any]] = (plan or {}).get(meal_key, []) or []
+    constraints: dict[str, Any] = _build_constraints(dining, rule)
+    same_type: list[dict[str, Any]] = [
+        dish
+        for dish in all_dishes
+        if int(dish.get("dish_type", 0)) == int(old_dish.get("dish_type", 0))
+    ]
+    pool: list[dict[str, Any]] = _candidate_pool(
+        same_type,
+        constraints,
+        _load_veg_map(),
+        rule,
+        region,
+        meal_key,
+        d,
+        1,
+    )
+    blocked_ids: set[int] = set(current_dish_ids)
+    blocked_ids.add(old_dish_id)
+    replacements: list[dict[str, Any]] = _select(pool, 1, excluded_ids=blocked_ids)
+    return replacements[0] if replacements else None

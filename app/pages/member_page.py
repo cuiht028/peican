@@ -34,8 +34,22 @@ def _chunked_rows(items: list, n: int = 3) -> list:
     """将控件列表按每行 n 个分组为 Row 列表（用于多列布局）。"""
     rows = []
     for i in range(0, len(items), n):
-        rows.append(ft.Row(items[i:i + n]))
+        rows.append(ft.Row(items[i:i + n], wrap=True))
     return rows
+
+
+def build_taste_preference_row(label: ft.Text, slider: ft.Slider) -> ft.Row:
+    """构建紧凑的单项口味偏好行。
+
+    Slider 使用固定的适配宽度而不是 ``expand``，避免在可滚动 Column
+    中取得无限可用高度并把后续表单控件挤出可视区域。
+    """
+    return ft.Row(
+        controls=[label, slider],
+        spacing=12,
+        wrap=True,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+    )
 
 
 def member_page(page: ft.Page) -> ft.View:
@@ -60,13 +74,13 @@ def member_page(page: ft.Page) -> ft.View:
                                        color=theme.COLOR_PRIMARY, weight=ft.FontWeight.BOLD),
                             theme.text("（" + m_dict["age_name"] + "）", theme.LARGE_TEXT,
                                        color=theme.COLOR_SECONDARY_TEXT),
-                            ft.Container(expand=True),
                             ft.IconButton(ft.Icons.EDIT, tooltip="编辑",
                                           on_click=lambda e, mid=m.id: navigate(page, f"/member_edit/{mid}")),
                             ft.IconButton(ft.Icons.DELETE, tooltip="删除",
                                           icon_color=theme.COLOR_ACCENT,
                                           on_click=lambda e, mid=m.id: _do_delete(page, mid)),
-                        ]
+                        ],
+                        wrap=True,
                     ),
                     theme.text(
                         "体质：" + ("、".join(m_dict["health_tag"]) if m_dict["health_tag"] else "无"),
@@ -78,7 +92,7 @@ def member_page(page: ft.Page) -> ft.View:
         cards.append(card)
 
     add_btn = theme.big_button("添加家庭成员", icon=ft.Icons.ADD,
-                               width=400, on_click=lambda e: navigate(page, "/member_edit"))
+                               on_click=lambda e: navigate(page, "/member_edit"))
 
     body = ft.Column(
         [
@@ -127,13 +141,13 @@ def member_edit_page(page: ft.Page) -> ft.View:
 
     name_field = ft.TextField(
         label="昵称", value=member.nick_name if member else "",
-        text_size=theme.LARGE_TEXT, width=320,
+        text_size=theme.LARGE_TEXT,
         label_style=theme.text_style(theme.LARGE_TEXT, theme.COLOR_SECONDARY_TEXT),
     )
     year_dd = ft.Dropdown(label="出生年", options=_year_options(), value=default_year,
-                          width=150, text_size=theme.LARGE_TEXT)
+                          text_size=theme.LARGE_TEXT)
     month_dd = ft.Dropdown(label="出生月", options=_month_options(), value=default_month,
-                           width=120, text_size=theme.LARGE_TEXT)
+                           text_size=theme.LARGE_TEXT)
     _initial_age = age_label(calc_age_type(f"{default_year}-{default_month}"))
     age_text = theme.text("推算年龄层：" + _initial_age, theme.LARGE_TEXT, color=theme.COLOR_PRIMARY)
 
@@ -148,8 +162,14 @@ def member_edit_page(page: ft.Page) -> ft.View:
         default_val = int((member.taste.get(dim, config.BASE_TASTE[dim])) if member else config.BASE_TASTE[dim])
         lbl = theme.text(config.TASTE_DIM_NAMES[dim] + "：" + config.TASTE_LABELS[default_val],
                          theme.LARGE_TEXT, color=theme.COLOR_TEXT)
-        sl = ft.Slider(min=1, max=4, divisions=3, value=default_val, width=240,
-                       on_change=lambda e, d=dim, l=lbl: _on_taste(e, d, l))
+        sl = ft.Slider(
+            min=1,
+            max=4,
+            divisions=3,
+            value=default_val,
+            width=220,
+            on_change=lambda e, d=dim, l=lbl: _on_taste(e, d, l),
+        )
         taste_sliders[dim] = sl
         taste_labels[dim] = lbl
 
@@ -164,7 +184,7 @@ def member_edit_page(page: ft.Page) -> ft.View:
     avoid_items = ft.TextField(
         label="忌口食材（逗号分隔，如 牛肉、虾）",
         value=",".join((member.avoid_food.get("items", [])) if member else []),
-        text_size=theme.LARGE_TEXT, width=320,
+        text_size=theme.LARGE_TEXT,
         label_style=theme.text_style(theme.LARGE_TEXT, theme.COLOR_SECONDARY_TEXT),
     )
     veg_switch = ft.Switch(label="素食（剔除荤腥）",
@@ -206,12 +226,15 @@ def member_edit_page(page: ft.Page) -> ft.View:
     body = ft.Column(
         [
             name_field,
-            ft.Row([year_dd, month_dd]),
+            ft.Row([year_dd, month_dd], wrap=True),
             age_text,
             ft.Container(height=6),
             theme.text("口味偏好（1 无 / 2 微 / 3 中 / 4 重）", theme.SUBTITLE_TEXT,
                        color=theme.COLOR_PRIMARY),
-            *[ft.Row([taste_labels[d], taste_sliders[d]]) for d in config.TASTE_DIMS],
+            *[
+                build_taste_preference_row(taste_labels[d], taste_sliders[d])
+                for d in config.TASTE_DIMS
+            ],
             ft.Container(height=6),
             theme.text("体质 / 健康标签", theme.SUBTITLE_TEXT, color=theme.COLOR_PRIMARY),
             *_chunked_rows([health_cbs[t] for t in config.HEALTH_TAGS], 3),
@@ -222,10 +245,10 @@ def member_edit_page(page: ft.Page) -> ft.View:
             veg_switch,
             ft.Container(height=16),
             ft.Row([
-                theme.big_button("保存", width=160, on_click=_on_save),
-                theme.big_button("取消", width=160, bgcolor=theme.COLOR_SECONDARY_TEXT,
+                theme.big_button("保存", on_click=_on_save),
+                theme.big_button("取消", bgcolor=theme.COLOR_SECONDARY_TEXT,
                                  on_click=lambda e: navigate(page, "/member")),
-            ]),
+            ], wrap=True),
         ],
         scroll=ft.ScrollMode.AUTO,
     )

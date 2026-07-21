@@ -1,109 +1,103 @@
-"""② 首页。
-
-展示当前城市 / 节气 / 养生提示，并提供主要功能的适老化大入口：
-今日一键配餐（→选人）、家庭宴请配餐、家庭成员管理、养生菜谱库。
-"""
+"""首页：节气信息、城市入口与配餐功能导航。"""
 
 from __future__ import annotations
 
-from app.nav import navigate
-
 import flet as ft
 
-from app import theme
+from app import config, theme
+from app.database import DB
+from app.nav import navigate
 from app.services.env_service import detect
 from app.services.member_service import member_count
 
-# 跨页共享：最近一次配餐结果与计划（被 result / shopping 页面读取）
-_LAST = {"result": None, "plan": None}
+_LAST: dict[str, object] = {"result": None, "plan": None}
+_CITY_OPTIONS: tuple[str, ...] = ("成都", "重庆", "其他")
 
 
 def store_plan(result: dict, plan: dict) -> None:
-    """保存最近一次配餐结果，供结果页 / 买菜页读取。"""
+    """保存最近生成的结果与计划，供结果页和购物页使用。"""
     _LAST["result"] = result
     _LAST["plan"] = plan
 
 
-def get_last() -> tuple:
-    """返回 (result, plan)，未生成时均为 None。"""
+def get_last() -> tuple[object, object]:
+    """返回内存中的最近一次配餐结果和计划。"""
     return _LAST["result"], _LAST["plan"]
 
 
+def _save_city(city: str) -> None:
+    """保存简单的手动城市选择；不依赖网络定位。"""
+    normalized: str = city if city in _CITY_OPTIONS else "成都"
+    DB.set_setting(config.SETTING_KEY_CITY, normalized)
+    DB.set_setting(config.SETTING_KEY_REGION_TYPE, "1" if normalized in ("成都", "重庆") else "2")
+
+
 def home_page(page: ft.Page) -> ft.View:
-    """构建首页视图。"""
-    env = detect()
-    has_member = member_count() > 0
+    """构建可滚动、窄屏友好的应用主页。"""
+    environment: dict = detect()
+    current_city: str = str(environment.get("city", "成都"))
+    if current_city not in _CITY_OPTIONS:
+        current_city = "成都"
+    has_member: bool = member_count() > 0
 
-    info_card = theme.card(
-        ft.Column(
-            [
-                ft.Row(
-                    [
-                        theme.text("城市：", theme.LARGE_TEXT, color=theme.COLOR_SECONDARY_TEXT),
-                        theme.text(env["city"], theme.LARGE_TEXT,
-                                   color=theme.COLOR_PRIMARY, weight=ft.FontWeight.BOLD),
-                        ft.Container(width=16),
-                        theme.text("节气：", theme.LARGE_TEXT, color=theme.COLOR_SECONDARY_TEXT),
-                        theme.text(env["solar_term"], theme.LARGE_TEXT,
-                                   color=theme.COLOR_ACCENT, weight=ft.FontWeight.BOLD),
-                    ]
-                ),
-                ft.Container(height=6),
-                theme.text("今日：" + env["date"], theme.HINT_TEXT,
-                           color=theme.COLOR_SECONDARY_TEXT),
-                ft.Container(height=10),
-                theme.text("养生提示", theme.SUBTITLE_TEXT,
-                           color=theme.COLOR_PRIMARY, weight=ft.FontWeight.BOLD),
-                ft.Container(height=4),
-                theme.text(env["health_tip"], theme.LARGE_TEXT, color=theme.COLOR_TEXT),
-            ]
-        )
+    city_dropdown = ft.Dropdown(
+        value=current_city,
+        options=[ft.dropdown.Option(city) for city in _CITY_OPTIONS],
+        text_size=theme.LARGE_TEXT,
+        label="城市",
+        label_style=theme.text_style(theme.HINT_TEXT, theme.COLOR_SECONDARY_TEXT),
+        dense=True,
+        width=145,
+        on_select=lambda event: _save_city(str(event.control.value)),
     )
+    info_card = theme.card(ft.Column([
+        ft.Row([
+            city_dropdown,
+            ft.Container(width=8),
+            theme.text(f"{environment['solar_term']} · {environment['date']}", theme.LARGE_TEXT,
+                       color=theme.COLOR_DEEP, weight=ft.FontWeight.BOLD),
+        ], wrap=True),
+        ft.Container(height=8),
+        theme.text("今日养生提示", theme.SUBTITLE_TEXT, color=theme.COLOR_DEEP,
+                   weight=ft.FontWeight.BOLD),
+        theme.text(str(environment["health_tip"]), theme.LARGE_TEXT, color=theme.COLOR_TEXT),
+    ]))
+    member_hint: ft.Control = theme.card(theme.text(
+        "还没有家庭成员。先录入成员信息，配餐会更贴合全家的口味和忌口。",
+        theme.LARGE_TEXT, color=theme.COLOR_SECONDARY_TEXT,
+    ), bgcolor=theme.COLOR_SURFACE_ALT) if not has_member else ft.Container()
 
-    if not has_member:
-        hint = theme.text(
-            "温馨提示：尚未添加家庭成员，建议先到「家庭成员管理」中录入信息，"
-            "配餐将更贴合全家体质。",
-            theme.LARGE_TEXT, color=theme.COLOR_ACCENT,
-        )
-    else:
-        hint = ft.Container()
-
+    buttons: list[ft.Control] = [
+        theme.big_button("今日一键配餐", icon=ft.Icons.RESTAURANT_MENU,
+                         on_click=lambda event: navigate(page, "/diner_select")),
+        theme.big_button("家庭宴请配餐", icon=ft.Icons.DINNER_DINING,
+                         bgcolor=theme.COLOR_DEEP,
+                         on_click=lambda event: navigate(page, "/banquet")),
+        theme.big_button("家庭成员管理", icon=ft.Icons.GROUP,
+                         bgcolor=theme.COLOR_PRIMARY_LIGHT, color=theme.COLOR_TEXT,
+                         on_click=lambda event: navigate(page, "/member")),
+        theme.big_button("养生菜谱库", icon=ft.Icons.MENU_BOOK,
+                         bgcolor=theme.COLOR_SURFACE_ALT, color=theme.COLOR_TEXT,
+                         on_click=lambda event: navigate(page, "/dish_library")),
+        theme.big_button("今日买菜清单", icon=ft.Icons.SHOPPING_CART,
+                         bgcolor=theme.COLOR_SURFACE_ALT, color=theme.COLOR_TEXT,
+                         on_click=lambda event: navigate(page, "/shopping")),
+    ]
     body = ft.Column(
-        [
+        controls=[
             info_card,
-            ft.Container(height=14),
-            hint,
-            ft.Container(height=8),
-            theme.big_button("今日一键配餐", icon=ft.Icons.RESTAURANT_MENU,
-                             on_click=lambda e: navigate(page, "/diner_select"), width=400),
-            ft.Container(height=12),
-            theme.big_button("家庭宴请配餐", icon=ft.Icons.DINNER_DINING,
-                             bgcolor=theme.COLOR_ACCENT,
-                             on_click=lambda e: navigate(page, "/banquet"), width=400),
-            ft.Container(height=12),
-            theme.big_button("家庭成员管理", icon=ft.Icons.GROUP,
-                             bgcolor=theme.COLOR_ACCENT,
-                             on_click=lambda e: navigate(page, "/member"), width=400),
-            ft.Container(height=12),
-            theme.big_button("养生菜谱库", icon=ft.Icons.MENU_BOOK,
-                             bgcolor=theme.COLOR_SECONDARY_TEXT,
-                             on_click=lambda e: navigate(page, "/dish_library"), width=400),
-            ft.Container(height=12),
-            theme.big_button("今日买菜清单", icon=ft.Icons.SHOPPING_CART,
-                             bgcolor=theme.COLOR_PRIMARY_LIGHT,
-                             on_click=lambda e: navigate(page, "/shopping"), width=400),
+            member_hint,
+            *[
+                ft.Container(
+                    content=button,
+                    margin=ft.Margin.only(top=8),
+                )
+                for button in buttons
+            ],
         ],
-        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
         scroll=ft.ScrollMode.AUTO,
+        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+        expand=True,
     )
-
-    return ft.View(
-        route="/home",
-        appbar=theme.app_bar("家庭养生配餐",
-                             leading=ft.IconButton(ft.Icons.ARROW_BACK,
-                                                   on_click=lambda e: navigate(page, "/"))),
-        controls=[body],
-        padding=20,
-        scroll=ft.ScrollMode.AUTO,
-    )
+    return ft.View(route="/home", appbar=theme.app_bar("家庭养生配餐"), controls=[body],
+                   padding=16, scroll=ft.ScrollMode.AUTO)

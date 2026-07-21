@@ -27,6 +27,21 @@ from app.services.env_service import get_region
 from app.pages.home_page import store_plan
 
 
+def build_meal_checkbox_row(checkboxes: list[ft.Checkbox]) -> ft.Row:
+    """创建强制单行展示的三餐勾选行。
+
+    Checkbox 自带标签，直接作为横向 Row 的子控件，避免嵌套 Row 在移动端
+    被逐项压缩换行。三个餐次始终按“早餐 / 午餐 / 晚餐”同一行展示。
+    """
+    return ft.Row(
+        controls=checkboxes,
+        spacing=8,
+        wrap=False,
+        alignment=ft.MainAxisAlignment.START,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+    )
+
+
 def diner_select_page(page: ft.Page) -> ft.View:
     """构建就餐人员选择视图。"""
     members = list_members()
@@ -79,12 +94,9 @@ def diner_select_page(page: ft.Page) -> ft.View:
             val_l = True
             val_d = True
 
-        cb_b = ft.Checkbox(label="早餐", value=val_b, label_style=theme.text_style(
-            theme.LARGE_TEXT, theme.COLOR_TEXT))
-        cb_l = ft.Checkbox(label="午餐", value=val_l, label_style=theme.text_style(
-            theme.LARGE_TEXT, theme.COLOR_TEXT))
-        cb_d = ft.Checkbox(label="晚餐", value=val_d, label_style=theme.text_style(
-            theme.LARGE_TEXT, theme.COLOR_TEXT))
+        cb_b = ft.Checkbox(label="早餐", value=val_b)
+        cb_l = ft.Checkbox(label="午餐", value=val_l)
+        cb_d = ft.Checkbox(label="晚餐", value=val_d)
 
         checkbox_map[m.id] = {"breakfast": cb_b, "lunch": cb_l, "dinner": cb_d}
 
@@ -99,10 +111,11 @@ def diner_select_page(page: ft.Page) -> ft.View:
                             ft.Container(width=8),
                             theme.text(f"（{age_name}）", theme.LARGE_TEXT,
                                        color=theme.COLOR_SECONDARY_TEXT),
-                        ]
+                        ],
+                        wrap=True,
                     ),
                     ft.Container(height=6),
-                    ft.Row([cb_b, cb_l, cb_d]),
+                    build_meal_checkbox_row([cb_b, cb_l, cb_d]),
                 ]
             )
         )
@@ -147,7 +160,7 @@ def diner_select_page(page: ft.Page) -> ft.View:
             *member_cards,
             ft.Container(height=16),
             theme.big_button("确认配餐", icon=ft.Icons.RESTAURANT_MENU,
-                             on_click=_on_confirm, width=400),
+                             on_click=_on_confirm),
         ],
         scroll=ft.ScrollMode.AUTO,
     )

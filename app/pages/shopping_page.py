@@ -65,12 +65,12 @@ def shopping_page(page: ft.Page) -> ft.View:
                     [
                         theme.text(it["name"], theme.LARGE_TEXT,
                                    color=theme.COLOR_TEXT, weight=ft.FontWeight.BOLD),
-                        ft.Container(expand=True),
                         theme.text(f"{int(it['grams'])}克", theme.LARGE_TEXT,
                                    color=theme.COLOR_SECONDARY_TEXT),
                         theme.text(f"约{it['jin']}斤", theme.LARGE_TEXT,
                                    color=theme.COLOR_PRIMARY, weight=ft.FontWeight.BOLD),
-                    ]
+                    ],
+                    wrap=True,
                 )
             )
         sections.append(
@@ -89,7 +89,6 @@ def shopping_page(page: ft.Page) -> ft.View:
     save_btn = theme.big_button(
         "暂存清单",
         icon=ft.Icons.SAVE,
-        width=400,
         bgcolor=theme.COLOR_SECONDARY_TEXT,
         on_click=lambda e: _on_save(page, _build_text(shopping)),
     )

@@ -1,7 +1,7 @@
 """⑦ 菜品详情。
 
-展示单道菜的完整信息：类型、口味、适宜 / 禁忌年龄与体质、主材、菜谱
-步骤、功效、适宜 / 禁忌人群、注意事项、适宜节气。
+详情页只保留家庭实际下厨所需的信息：主要食材、家庭做法、搭配建议、
+忌口提示、注意事项和返回导航。
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ from app.nav import navigate
 
 import flet as ft
 
-from app import config
 from app import theme
 from app.database import DB
 from app.models.dish import DishMain
@@ -18,6 +17,17 @@ from app.models.dish import DishMain
 
 def _join(labels: list) -> str:
     return "、".join(labels) if labels else "通用 / 无特殊"
+
+
+def build_recipe_details(dish: dict) -> dict[str, str]:
+    """从完整或旧版菜品数据构建详情页所需的可读辅助说明。"""
+    steps: list[str] = dish.get("recipe_steps", []) or []
+    taboo: str = str(dish.get("taboo_crowd", "")).strip()
+    return {
+        "steps": "\n".join(f"{index + 1}. {step}" for index, step in enumerate(steps)) or "食材洗净切好后，用少油少盐的方式炒、煮或蒸熟即可；口味可按家庭成员调整。",
+        "pairing_tip": "搭配主食与不同颜色蔬菜，营养更均衡；口味宜清淡，按家庭成员食量调整。",
+        "taboo_tip": taboo or "无特殊忌口；对主材过敏者请勿食用。",
+    }
 
 
 def dish_detail_page(page: ft.Page) -> ft.View:
@@ -49,59 +59,30 @@ def dish_detail_page(page: ft.Page) -> ft.View:
 
     dish = DishMain.from_row(row).to_dict()
 
-    def fmt_taste(taste: dict) -> str:
-        return "，".join(
-            f"{config.TASTE_DIM_NAMES[d]}{config.TASTE_LABELS.get(taste.get(d, 2), '')}"
-            for d in config.TASTE_DIMS
-        )
-
     ingredients_lines = "\n".join(
         f"· {ing['name']}（{ing['grams']}克）" for ing in dish["main_ingredients"]
     ) or "无"
-    steps_lines = "\n".join(
-        f"{i + 1}. {s}" for i, s in enumerate(dish["recipe_steps"])
-    ) or "无"
+    recipe_details = build_recipe_details(dish)
 
     info = ft.Column(
         [
-            theme.text("菜名：" + dish["dish_name"], theme.TITLE_TEXT,
-                       color=theme.COLOR_PRIMARY, weight=ft.FontWeight.BOLD),
-            ft.Container(height=8),
-            theme.text("类型：" + dish["dish_type_name"], theme.LARGE_TEXT,
-                       color=theme.COLOR_SECONDARY_TEXT),
-            ft.Container(height=6),
-            theme.text("口味：" + fmt_taste(dish["taste"]), theme.LARGE_TEXT,
-                       color=theme.COLOR_TEXT),
-            ft.Container(height=6),
-            theme.text("适宜年龄：" + _join([config.AGE_TYPES.get(a, str(a)) for a in dish["suit_age"]]),
-                       theme.LARGE_TEXT, color=theme.COLOR_TEXT),
-            theme.text("禁忌年龄：" + _join([config.AGE_TYPES.get(a, str(a)) for a in dish["forbid_age"]]),
-                       theme.LARGE_TEXT, color=theme.COLOR_TEXT),
-            theme.text("适宜体质：" + _join(dish["suit_health"]), theme.LARGE_TEXT,
-                       color=theme.COLOR_TEXT),
-            theme.text("禁忌体质：" + _join(dish["forbid_health"]), theme.LARGE_TEXT,
-                       color=theme.COLOR_TEXT),
-            ft.Container(height=10),
-            theme.text("功效", theme.SUBTITLE_TEXT, color=theme.COLOR_PRIMARY,
-                       weight=ft.FontWeight.BOLD),
-            theme.text(dish["efficacy"] or "无", theme.LARGE_TEXT, color=theme.COLOR_TEXT),
-            ft.Container(height=8),
-            theme.text("主材（每人份）", theme.SUBTITLE_TEXT, color=theme.COLOR_PRIMARY,
+            theme.text("主要食材（每人份）", theme.SUBTITLE_TEXT, color=theme.COLOR_PRIMARY,
                        weight=ft.FontWeight.BOLD),
             theme.text(ingredients_lines, theme.LARGE_TEXT, color=theme.COLOR_TEXT),
             ft.Container(height=8),
-            theme.text("菜谱步骤", theme.SUBTITLE_TEXT, color=theme.COLOR_PRIMARY,
+            theme.text("家庭做法", theme.SUBTITLE_TEXT, color=theme.COLOR_PRIMARY,
                        weight=ft.FontWeight.BOLD),
-            theme.text(steps_lines, theme.LARGE_TEXT, color=theme.COLOR_TEXT),
+            theme.text(recipe_details["steps"], theme.LARGE_TEXT, color=theme.COLOR_TEXT),
             ft.Container(height=8),
-            theme.text("适宜人群：" + (dish["suitable_crowd"] or "无"), theme.LARGE_TEXT,
-                       color=theme.COLOR_TEXT),
-            theme.text("禁忌人群：" + (dish["taboo_crowd"] or "无"), theme.LARGE_TEXT,
-                       color=theme.COLOR_TEXT),
+            theme.text("搭配建议", theme.SUBTITLE_TEXT, color=theme.COLOR_PRIMARY,
+                       weight=ft.FontWeight.BOLD),
+            theme.text(recipe_details["pairing_tip"], theme.LARGE_TEXT, color=theme.COLOR_TEXT),
+            ft.Container(height=8),
+            theme.text("忌口提示", theme.SUBTITLE_TEXT, color=theme.COLOR_PRIMARY,
+                       weight=ft.FontWeight.BOLD),
+            theme.text(recipe_details["taboo_tip"], theme.LARGE_TEXT, color=theme.COLOR_TEXT),
             theme.text("注意事项：" + (dish["note"] or "无"), theme.LARGE_TEXT,
                        color=theme.COLOR_TEXT),
-            theme.text("适宜节气：" + (_join(dish["suit_solar"]) if dish["suit_solar"] else "四季通用"),
-                       theme.LARGE_TEXT, color=theme.COLOR_TEXT),
         ]
     )
 

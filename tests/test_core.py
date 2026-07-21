@@ -24,6 +24,8 @@ import sys
 import tempfile
 import unittest
 from collections import Counter
+
+import flet as ft
 from datetime import date
 
 # ---------------------------------------------------------------------------
@@ -39,7 +41,7 @@ _REAL_DB_PATH = os.path.join(_PROJECT_ROOT, "meal.db")
 _real_db_existed = os.path.exists(_REAL_DB_PATH)
 
 import app.database as db_mod  # noqa: E402  (会在 import 时连接真实库)
-from app import config  # noqa: E402
+from app import config, theme  # noqa: E402
 from app.models.member import FamilyMember  # noqa: E402
 from app.data.seed_loader import run as seed_run  # noqa: E402
 from app.services.age_service import calc_age_type, age_label  # noqa: E402
@@ -62,11 +64,33 @@ from app.services.member_service import (  # noqa: E402
     save_banquet_selection,
     load_banquet_selection,
 )
-from app.services.meal_planner import generate_daily_meals  # noqa: E402
+from app.services.meal_planner import (  # noqa: E402
+    _RECENT_MEAL_HISTORY,
+    _adjust_structure_for_noodle,
+    _is_noodle_staple,
+    generate_daily_meals,
+    replace_dish,
+)
 from app.services.shopping_service import (  # noqa: E402
     build_shopping_list,
     convert_weight,
+    is_shopping_ingredient,
 )
+from app.pages.diner_select_page import (  # noqa: E402
+    build_meal_checkbox_row,
+    diner_select_page,
+)
+from app.pages.member_page import (  # noqa: E402
+    build_taste_preference_row,
+    member_page,
+    member_edit_page,
+)
+from app.pages.dish_detail_page import dish_detail_page  # noqa: E402
+from app.pages.result_page import (  # noqa: E402
+    build_result_action_grid,
+    result_action_labels,
+)
+from app.pages.dish_detail_page import build_recipe_details  # noqa: E402
 
 
 @atexit.register
@@ -256,8 +280,10 @@ class TestSeedLoader(BaseDBTest):
             "ingredient": len(INGREDIENT_SEED),
         }
         self.assertEqual(expected["solar_health_rule"], 24)
-        self.assertEqual(expected["dish_main"], 105)
-        self.assertEqual(expected["ingredient"], 115)
+        # 原有108道菜、115种食材；家常菜谱融合后保留扩展下限，避免未来
+        # 合理补充家常菜时让测试反向限制种子库增长。
+        self.assertGreaterEqual(expected["dish_main"], 171)
+        self.assertGreaterEqual(expected["ingredient"], 146)
 
         def counts() -> dict:
             out = {}
@@ -277,6 +303,31 @@ class TestSeedLoader(BaseDBTest):
         # 记录数在多次运行后保持不变，且符合预期
         self.assertEqual(after_first, expected)
         self.assertEqual(after_second, expected)
+
+    def test_home_recipe_merge_has_complete_unique_representatives(self) -> None:
+        """融合菜谱可加载，代表性四类菜字段完整且无重名。"""
+        rows = db_mod.DB.query("SELECT * FROM dish_main ORDER BY id")
+        names = [str(row["dish_name"]) for row in rows]
+        self.assertEqual(len(names), len(set(names)), "菜品种子不得有重名")
+
+        expected_types = {
+            "杂粮粥": 1,
+            "蒜蓉油麦菜": 2,
+            "清蒸鲈鱼": 3,
+            "紫菜蛋花汤": 4,
+            "皮蛋拌豆腐": 2,
+            "凉拌鸡丝": 3,
+        }
+        by_name = {str(row["dish_name"]): row for row in rows}
+        for dish_name, dish_type in expected_types.items():
+            with self.subTest(dish_name=dish_name):
+                row = by_name.get(dish_name)
+                self.assertIsNotNone(row)
+                self.assertEqual(int(row["dish_type"]), dish_type)
+                self.assertTrue(config.json_decode(row["main_ingredients"]))
+                self.assertTrue(config.json_decode(row["recipe_steps"]))
+                self.assertTrue(str(row["efficacy"]).strip())
+                self.assertTrue(str(row["suitable_crowd"]).strip())
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +410,7 @@ class TestMemberService(BaseDBTest):
 class TestMealPlanner(BaseDBTest):
     def setUp(self) -> None:
         self._reseed()
+        _RECENT_MEAL_HISTORY.clear()
 
     def _normal_member(self) -> FamilyMember:
         return FamilyMember(
@@ -480,6 +532,120 @@ class TestMealPlanner(BaseDBTest):
         self.assertIn("term", result)
         self.assertIn("health_tip", result)
 
+    def test_breakfast_excludes_heavy_spicy_main_dishes(self) -> None:
+        """早餐只选清淡候选，不出现重辣重油主菜。"""
+        plan = build_today_plan([self._normal_member()])
+        result = generate_daily_meals(date(2024, 6, 21), 1, plan)
+        prohibited = ("毛血旺", "冒菜", "肥肠鱼", "肥肠", "水煮", "辣子", "麻辣")
+        for dish in result["meals"]["breakfast"]:
+            self.assertFalse(any(token in dish["dish_name"] for token in prohibited))
+            self.assertLess(dish["taste"]["spicy"], 3)
+            self.assertLess(dish["taste"]["numb"], 3)
+
+    def test_daily_menu_has_no_cross_meal_duplicate_dishes(self) -> None:
+        """同一天早餐、午餐、晚餐之间不得重复同一道菜。"""
+        plan = build_today_plan([self._normal_member()])
+        result = generate_daily_meals(date(2024, 6, 21), 1, plan)
+        all_ids = [dish["id"] for dish in self._all_dishes(result)]
+        self.assertEqual(len(all_ids), len(set(all_ids)))
+
+    def test_regenerate_avoids_previous_menu_when_candidates_are_sufficient(self) -> None:
+        """主动重配优先避开上一套菜，候选充足时整体菜品不重合。"""
+        plan = build_today_plan([self._normal_member()])
+        first = generate_daily_meals(date(2024, 6, 21), 1, plan, rotation_seed=0)
+        first_ids = {dish["id"] for dish in self._all_dishes(first)}
+        refreshed = generate_daily_meals(
+            date(2024, 6, 21),
+            1,
+            plan,
+            rotation_seed=1,
+            avoid_dish_ids=first_ids,
+        )
+        refreshed_ids = {dish["id"] for dish in self._all_dishes(refreshed)}
+        self.assertTrue(refreshed_ids)
+        self.assertFalse(first_ids & refreshed_ids)
+        self.assertEqual(
+            len([dish["id"] for dish in self._all_dishes(refreshed)]),
+            len(refreshed_ids),
+        )
+
+    def test_recent_plan_penalty_rotates_next_day_dishes(self) -> None:
+        """连续生成相邻日期方案时，历史记录降低完全重复概率。"""
+        plan = build_today_plan([self._normal_member()])
+        first = generate_daily_meals(date(2024, 6, 21), 1, plan)
+        second = generate_daily_meals(date(2024, 6, 22), 1, plan)
+        first_ids = {dish["id"] for dish in self._all_dishes(first)}
+        second_ids = {dish["id"] for dish in self._all_dishes(second)}
+        self.assertLess(len(first_ids & second_ids), len(first_ids))
+
+    def test_breakfast_prefers_porridge_and_small_dish(self) -> None:
+        """早餐候选充足时优先粥类主食和小菜/凉菜。"""
+        plan = build_today_plan([self._normal_member()])
+        result = generate_daily_meals(date(2024, 6, 21), 1, plan)
+        breakfast = result["meals"]["breakfast"]
+        names = {dish["dish_name"] for dish in breakfast}
+
+        self.assertTrue(any("粥" in name or "羹" in name for name in names))
+        self.assertTrue(
+            any("凉拌" in name or "豆花" in name or "小菜" in name for name in names)
+        )
+
+    def test_lunch_and_dinner_prioritize_solar_term_dishes(self) -> None:
+        """午晚餐在当令菜候选存在时至少选入一项。"""
+        plan = build_today_plan([self._normal_member()])
+        result = generate_daily_meals(date(2024, 6, 21), 1, plan)
+        solar_term = result["term"]
+        lunch_dinner = result["meals"]["lunch"] + result["meals"]["dinner"]
+
+        self.assertTrue(
+            any(solar_term in dish["suit_solar"] for dish in lunch_dinner),
+            f"午晚餐未选择适合{solar_term}的菜品",
+        )
+
+    def test_replace_dish_returns_compatible_unused_dish(self) -> None:
+        """替换菜品保持类型，且不返回当前方案已使用的菜。"""
+        plan = build_today_plan([self._normal_member()])
+        result = generate_daily_meals(date(2024, 6, 21), 1, plan)
+        old_dish = result["meals"]["lunch"][0]
+        current_ids = {
+            dish["id"] for dish in self._all_dishes(result)
+        }
+
+        replacement = replace_dish(
+            date(2024, 6, 21),
+            1,
+            plan,
+            "lunch",
+            old_dish["id"],
+            current_ids,
+        )
+
+        self.assertIsNotNone(replacement)
+        self.assertEqual(replacement["dish_type"], old_dish["dish_type"])
+        self.assertNotIn(replacement["id"], current_ids)
+
+    def test_replace_dish_rejects_invalid_meal_key(self) -> None:
+        """替换接口对非定义餐次安全返回空结果。"""
+        plan = build_today_plan([self._normal_member()])
+
+        replacement = replace_dish(
+            date(2024, 6, 21), 1, plan, "brunch", 1, set()
+        )
+
+        self.assertIsNone(replacement)
+
+    def test_noodle_staple_reduces_side_dishes_but_keeps_balance(self) -> None:
+        noodle = {"dish_type": 1, "dish_name": "番茄鸡蛋面"}
+        normal = {"dish_type": 1, "dish_name": "粗粮饭"}
+        self.assertTrue(_is_noodle_staple(noodle))
+        self.assertFalse(_is_noodle_staple(normal))
+        source = {1: 1, 2: 2, 3: 1, 4: 1}
+        adjusted = _adjust_structure_for_noodle(source, noodle, "lunch")
+        self.assertEqual(adjusted[2], 1)
+        self.assertEqual(adjusted[3], 1)
+        self.assertEqual(adjusted[4], 1)
+        self.assertEqual(source[2], 2)
+
 
 # 羊肉忌口：种子库当前没有任何使用「羊肉」的菜品，
 # 故通过注入一条受控的羊肉菜品来真正验证忌口剔除逻辑。
@@ -584,6 +750,165 @@ class TestShoppingService(BaseDBTest):
     def test_empty_input_no_crash(self) -> None:
         res = build_shopping_list({}, {})
         self.assertEqual(res, {})
+
+    def test_excludes_staples_and_seasonings(self) -> None:
+        meals = {
+            "breakfast": [{"main_ingredients": [
+                {"name": "大米", "grams": 150}, {"name": "葱", "grams": 5},
+                {"name": "酱油", "grams": 8}, {"name": "食用油", "grams": 20},
+                {"name": "料酒", "grams": 10}, {"name": "蚝油", "grams": 8},
+                {"name": "鸡精", "grams": 3}, {"name": "白菜", "grams": 200},
+                {"name": "鸡蛋", "grams": 50},
+            ]}],
+            "lunch": [], "dinner": [],
+        }
+        plan = {"breakfast": [{"age_type": 4}], "lunch": [], "dinner": []}
+        flattened = {item["name"] for items in build_shopping_list(meals, plan).values() for item in items}
+        self.assertEqual(flattened, {"白菜", "鸡蛋"})
+        self.assertFalse(is_shopping_ingredient("大米"))
+        self.assertFalse(is_shopping_ingredient("糯米"))
+        self.assertFalse(is_shopping_ingredient("面粉"))
+        self.assertFalse(is_shopping_ingredient("面条"))
+        self.assertFalse(is_shopping_ingredient("辣椒油"))
+        for seasoning in ("食用油", "料酒", "蚝油", "鸡精"):
+            self.assertFalse(is_shopping_ingredient(seasoning))
+        self.assertTrue(is_shopping_ingredient("猪肉"))
+        self.assertTrue(is_shopping_ingredient("鸡肉"))
+        self.assertTrue(is_shopping_ingredient("西红柿"))
+
+
+class TestFletCompatibility(unittest.TestCase):
+    """验证主题和页面模块可在当前 Flet API 下安全导入。"""
+
+    def test_theme_card_uses_current_border_api(self) -> None:
+        """构建主题卡片时不访问已移除的 ``ft.border.all``。"""
+        card = theme.card(ft.Text("边框兼容性"))
+        self.assertIsInstance(card.border, ft.Border)
+        self.assertEqual(card.border.top.width, 1)
+        self.assertEqual(card.border.top.color, theme.COLOR_BORDER)
+
+    def test_big_button_uses_supported_content_argument(self) -> None:
+        """主题按钮工厂不向 Flet ``Button`` 传入已移除的 ``text`` 参数。"""
+        button = theme.big_button("按钮兼容性", disabled=True)
+
+        self.assertIsInstance(button, ft.ElevatedButton)
+        self.assertEqual(button.content, "按钮兼容性")
+        self.assertTrue(button.disabled)
+
+    def test_page_package_imports_without_legacy_border_error(self) -> None:
+        """页面包导入不触发旧版 ``border.all`` 属性错误。"""
+        import app.pages as pages
+
+        self.assertTrue(callable(pages.home_page))
+        self.assertTrue(callable(pages.member_page))
+
+
+class _StubPage:
+    """无需 GUI 会话即可构造 Flet 路由视图的最小页面替身。"""
+
+    def __init__(self, route: str) -> None:
+        self.route = route
+        self.views: list[ft.View] = []
+        self.on_route_change = None
+
+    def update(self) -> None:
+        """模拟 Flet 页面更新。"""
+
+    def show_dialog(self, dialog: ft.Control) -> None:
+        """模拟 Flet 对话框展示。"""
+
+
+class TestRouteViewConstruction(BaseDBTest):
+    """确认受影响路由可离线构造，不会退化为空白页。"""
+
+    def setUp(self) -> None:
+        self._reseed()
+
+    def test_member_and_member_edit_views_construct_controls(self) -> None:
+        member_view = member_page(_StubPage("/member"))
+        add_view = member_edit_page(_StubPage("/member_edit"))
+        self.assertIsInstance(member_view, ft.View)
+        self.assertGreater(len(member_view.controls), 0)
+        self.assertGreater(len(add_view.controls), 0)
+        self.assertEqual(add_view.appbar.title.value, "添加成员")
+
+        saved_id = save_member(FamilyMember(nick_name="路由成员", birth_ym="1990-01"))
+        edit_view = member_edit_page(_StubPage(f"/member_edit/{saved_id}"))
+        self.assertGreater(len(edit_view.controls), 0)
+        self.assertEqual(edit_view.appbar.title.value, "编辑成员")
+
+    def test_diner_and_dish_detail_views_construct_controls(self) -> None:
+        diner_view = diner_select_page(_StubPage("/diner_select"))
+        detail_view = dish_detail_page(_StubPage("/dish/1"))
+        self.assertGreater(len(diner_view.controls), 0)
+        self.assertGreater(len(detail_view.controls), 0)
+
+
+class TestPresentationHelpers(unittest.TestCase):
+    """验证关键页面的独立布局辅助函数。"""
+
+    def test_meal_checkbox_row_forces_single_line_with_native_labels(self) -> None:
+        checkboxes = [
+            ft.Checkbox(label="早餐"),
+            ft.Checkbox(label="午餐"),
+            ft.Checkbox(label="晚餐"),
+        ]
+        row = build_meal_checkbox_row(checkboxes)
+        self.assertEqual(row.controls, checkboxes)
+        self.assertFalse(row.wrap)
+        self.assertEqual(row.spacing, 8)
+        self.assertEqual(row.alignment, ft.MainAxisAlignment.START)
+        self.assertEqual([checkbox.label for checkbox in checkboxes], ["早餐", "午餐", "晚餐"])
+
+    def test_taste_preference_row_keeps_slider_compact(self) -> None:
+        label = ft.Text("辣度：中")
+        slider = ft.Slider(min=1, max=4, value=3, width=220)
+        row = build_taste_preference_row(label, slider)
+        self.assertEqual(row.controls, [label, slider])
+        self.assertFalse(bool(slider.expand))
+        self.assertEqual(slider.width, 220)
+        self.assertIsNone(slider.height)
+
+    def test_member_edit_form_keeps_controls_after_taste_preferences(self) -> None:
+        view = member_edit_page(_StubPage("/member_edit"))
+        body = view.controls[0]
+        control_values = [
+            control.value
+            for control in body.controls
+            if isinstance(control, ft.Text)
+        ]
+        self.assertIn("体质 / 健康标签", control_values)
+        self.assertIn("忌口设置", control_values)
+        self.assertTrue(any(
+            isinstance(control, ft.Switch)
+            and control.label == "素食（剔除荤腥）"
+            for control in body.controls
+        ))
+        self.assertTrue(any(
+            isinstance(control, ft.Row)
+            and any(isinstance(item, ft.Slider) for item in control.controls)
+            for control in body.controls
+        ))
+
+    def test_result_action_grid_uses_fixed_two_by_two_order(self) -> None:
+        labels = result_action_labels()
+        self.assertEqual(labels, ("重新配餐", "更替选菜", "买菜清单", "保存配餐"))
+        grid = build_result_action_grid([theme.big_button(label) for label in labels])
+        self.assertEqual(len(grid.controls), 2)
+        first_row = [container.content.content for container in grid.controls[0].controls]
+        second_row = [container.content.content for container in grid.controls[1].controls]
+        self.assertEqual(first_row, list(labels[:2]))
+        self.assertEqual(second_row, list(labels[2:]))
+        with self.assertRaises(ValueError):
+            build_result_action_grid([theme.big_button("仅一个")])
+
+    def test_recipe_details_only_exposes_practical_sections(self) -> None:
+        details = build_recipe_details({"recipe_steps": [], "taboo_crowd": ""})
+        self.assertIn("少油少盐", details["steps"])
+        self.assertIn("搭配", details["pairing_tip"])
+        self.assertIn("过敏", details["taboo_tip"])
+        self.assertNotIn("meal_time", details)
+        self.assertNotIn("nutrition_tip", details)
 
 
 # ===========================================================================

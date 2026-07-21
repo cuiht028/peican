@@ -39,7 +39,7 @@ def build_view(page: ft.Page, route: str) -> ft.View:
         return member_edit_page(page)
 
     mapping = {
-        "/": splash_page,
+        "/": home_page,
         "/home": home_page,
         "/member": member_page,
         "/diner_select": diner_select_page,
@@ -49,7 +49,7 @@ def build_view(page: ft.Page, route: str) -> ft.View:
         "/shopping": shopping_page,
         "/solar": solar_page,
     }
-    builder = mapping.get(route, splash_page)
+    builder = mapping.get(route, home_page)
     return builder(page)
 
 
@@ -82,7 +82,7 @@ def main(page: ft.Page) -> None:
 
     # flet 0.86 中 page.go() 用 asyncio.create_task 异步调度，
     # 在 main() 初始化阶段不会立即执行，故直接构建首页视图
-    on_route_change(page, "/")
+    on_route_change(page, "/home")
 
 
 if __name__ == "__main__":

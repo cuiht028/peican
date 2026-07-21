@@ -192,10 +192,17 @@ def get_meal_structure(headcount: int, banquet: bool = False) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# app_setting 键名（V1.1 选人记忆持久化）
+# app_setting 键名（选人记忆及首页城市选择）
 # ---------------------------------------------------------------------------
 SETTING_KEY_LAST_DINER: str = "last_diner_selection"
 SETTING_KEY_LAST_BANQUET: str = "last_banquet_selection"
+SETTING_KEY_CITY: str = "city"
+SETTING_KEY_REGION_TYPE: str = "region_type"
+
+# 午晚餐选择面食主食后减少配菜，保留一荤一素/汤的基本搭配。
+NOODLE_STAPLE_TOKENS: tuple[str, ...] = (
+    "面", "饺", "抄手", "馄饨", "粉", "米线",
+)
 
 # ---------------------------------------------------------------------------
 # 单家庭默认 user_id
