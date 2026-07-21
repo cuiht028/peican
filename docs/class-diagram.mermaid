@@ -1,0 +1,67 @@
+classDiagram
+    class FamilyMember {
+        +int id
+        +str nick_name
+        +int age_type
+        +int is_eat_breakfast
+        +int is_eat_lunch
+        +int is_eat_dinner
+        +dict taste
+        +dict avoid_food
+        +list health_tag
+        +to_dict() dict
+        +from_row(row) FamilyMember
+        +eat_meals() list~str~
+    }
+
+    class UserTemplate {
+        +int id
+        +str template_name
+        +int template_type
+        +list family_config
+        +int guest_num
+        +int guest_child_num
+        +to_dict() dict
+        +from_row(row) UserTemplate
+    }
+
+    class MemberService {
+        +list_members() list~FamilyMember~
+        +save_member(member) int
+        +build_today_plan(members) dict
+        +build_plan_from_selection(members, selection) dict
+        +build_banquet_plan(members, ids, adults, children, elderly, meal) dict
+        +save_diner_selection(selection) void
+        +load_diner_selection() list~dict~
+        +save_banquet_selection(data) void
+        +load_banquet_selection() dict
+        +list_templates() list~UserTemplate~
+        +save_template(tpl) int
+        +apply_template(id) bool
+    }
+
+    class MealPlanner {
+        +generate_daily_meals(d, region, plan) dict
+        -_load_dishes(region) list~dict~
+        -_build_constraints(dining, rule) dict
+        -_hard_eliminate(dish, ctx, veg_map, strict) bool
+        -_score_dish(dish, ctx, rule, region, meal_key) int
+        -_select(pool, count, offset) list~dict~
+    }
+
+    class Config {
+        +DISH_COUNT_BY_HEADCOUNT dict
+        +get_meal_structure(headcount, banquet) dict
+        +SETTING_KEY_LAST_DINER str
+        +SETTING_KEY_LAST_BANQUET str
+        +MEAL_KEYS list~str~
+        +DISH_TYPES dict
+    }
+
+    FamilyMember ..> Config : uses constants
+    UserTemplate ..> Config : uses constants
+    MemberService ..> FamilyMember : manages
+    MemberService ..> UserTemplate : manages
+    MemberService ..> Config : uses
+    MealPlanner ..> Config : uses DISH_COUNT_BY_HEADCOUNT
+    MealPlanner ..> MemberService : build_today_plan fallback
