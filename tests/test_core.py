@@ -425,9 +425,13 @@ class TestMealPlanner(BaseDBTest):
         meals = result["meals"]
 
         # 1人 → DISH_COUNT_BY_HEADCOUNT[(1,2)]
-        self.assertEqual(
-            self._count_types(meals["breakfast"]),
-            {1: 1, 2: 1},
+        # 早餐主食可以是 type=1 或 type=5（早餐专用）
+        breakfast_types = self._count_types(meals["breakfast"])
+        self.assertEqual(len(meals["breakfast"]), 2, "早餐应有两道菜")
+        self.assertTrue(
+            (breakfast_types.get(1) == 1 and breakfast_types.get(2) == 1) or
+            (breakfast_types.get(5) == 1 and breakfast_types.get(2) == 1),
+            "早餐应是主食+素菜（主食可为type=1或type=5）"
         )
         self.assertEqual(
             self._count_types(meals["lunch"]),
@@ -510,9 +514,13 @@ class TestMealPlanner(BaseDBTest):
                 result = generate_daily_meals(d, 1, plan)
                 meals = result["meals"]
                 # 1人 → DISH_COUNT_BY_HEADCOUNT[(1,2)]
-                self.assertEqual(
-                    self._count_types(meals["breakfast"]),
-                    {1: 1, 2: 1},
+                # 早餐主食可以是 type=1 或 type=5（早餐专用）
+                breakfast_types = self._count_types(meals["breakfast"])
+                self.assertEqual(len(meals["breakfast"]), 2, "早餐应有两道菜")
+                self.assertTrue(
+                    (breakfast_types.get(1) == 1 and breakfast_types.get(2) == 1) or
+                    (breakfast_types.get(5) == 1 and breakfast_types.get(2) == 1),
+                    "早餐应是主食+素菜（主食可为type=1或type=5）"
                 )
                 self.assertEqual(
                     self._count_types(meals["lunch"]),
@@ -937,9 +945,13 @@ class TestGetMealStructure(unittest.TestCase):
             with self.subTest(headcount=headcount):
                 result = config.get_meal_structure(headcount)
                 expected = config.DISH_COUNT_BY_HEADCOUNT[expected_key]
-                # 比较三餐结构完全一致（banquet=False 时）
+                # 比较三餐结构完全一致（banquet=False 时）。
+                # get_meal_structure 已归一化含 1..5 全部键，期望值同步归一化。
                 for meal in config.MEAL_KEYS:
-                    self.assertEqual(result[meal], expected[meal],
+                    expected_meal = dict(expected[meal])
+                    for dt in (1, 2, 3, 4, 5):
+                        expected_meal.setdefault(dt, 0)
+                    self.assertEqual(result[meal], expected_meal,
                                      f"headcount={headcount} meal={meal} mismatch")
 
     def test_zero_headcount_returns_all_zero(self) -> None:
@@ -951,12 +963,15 @@ class TestGetMealStructure(unittest.TestCase):
                                  f"0人时 {meal}[{dt}] 应为 0")
 
     def test_total_dish_counts_match_spec(self) -> None:
-        """V1.1 规格：1-2人7道 / 3-4人10道 / 5-6人12道 / ≥7人15道。"""
+        """V1.1 规格（早餐改用 type=5 轻量结构，共 2 道）：
+        1-2人7道 / 3-4人9道 / 5-6人11道 / ≥7人13道。
+        统计含 dish_type=1..5 全部键。
+        """
         expected_totals = {
             1: 7, 2: 7,
-            3: 10, 4: 10,
-            5: 12, 6: 12,
-            7: 15, 10: 15,
+            3: 9, 4: 9,
+            5: 11, 6: 11,
+            7: 13, 10: 13,
         }
         for headcount, expected_total in expected_totals.items():
             with self.subTest(headcount=headcount):
@@ -964,7 +979,7 @@ class TestGetMealStructure(unittest.TestCase):
                 actual = sum(
                     result[meal][dt]
                     for meal in config.MEAL_KEYS
-                    for dt in (1, 2, 3, 4)
+                    for dt in (1, 2, 3, 4, 5)
                 )
                 self.assertEqual(actual, expected_total,
                                  f"headcount={headcount} 总菜数={actual}, 期望={expected_total}")

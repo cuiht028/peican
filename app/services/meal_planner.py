@@ -29,6 +29,10 @@ _BREAKFAST_HEAVY_TOKENS: tuple[str, ...] = (
     "毛血旺", "冒菜", "肥肠鱼", "肥肠", "水煮", "辣子", "麻辣", "香辣",
     "回锅", "红烧肉", "粉蒸", "烧白", "烤鸭", "卤拼", "油焖", "郡肝",
 )
+# 用户明确点名不宜出现在早餐的菜品（即便属素菜/小菜类型也不上早餐）。
+_BREAKFAST_EXCLUDE_NAMES: tuple[str, ...] = (
+    "豆花饭", "皮蛋拌豆腐", "凉拌猪耳朵",
+)
 _BREAKFAST_PORRIDGE_TOKENS: tuple[str, ...] = ("粥", "羹", "豆花")
 _BREAKFAST_GRAIN_TOKENS: tuple[str, ...] = (
     "粗粮", "小米", "玉米", "荞麦", "高粱", "红薯", "紫米", "薏米",
@@ -150,6 +154,8 @@ def _is_breakfast_unsuitable(dish: dict[str, Any]) -> bool:
     taste: dict[str, Any] = dish.get("taste", {}) or {}
     if any(token in dish_name for token in _BREAKFAST_HEAVY_TOKENS):
         return True
+    if dish_name in _BREAKFAST_EXCLUDE_NAMES:
+        return True
     return int(taste.get("spicy", 2)) >= 3 or int(taste.get("numb", 2)) >= 3
 
 
@@ -206,6 +212,7 @@ def _score_dish(
     meal_key: str,
     target_date: date,
     rotation_seed: int = 0,
+    avoided_ids: Optional[set[int]] = None,
 ) -> int:
     """计算菜品综合分，分数越高优先级越高。"""
     score: int = 0
@@ -256,6 +263,11 @@ def _score_dish(
 
     dish_id: int = int(dish.get("id", 0))
     score -= _history_penalty(dish_id, target_date)
+
+    # 重新配餐时，对上次菜单中的菜品大幅降权，确保明显变化
+    if avoided_ids and dish_id in avoided_ids:
+        score -= 50
+
     # 日期/轮换 seed 只用于同分候选的稳定排序，绝不覆盖健康和节气权重。
     del rotation_seed
     return score
@@ -269,12 +281,13 @@ def _to_scored_candidate(
     meal_key: str,
     target_date: date,
     rotation_seed: int = 0,
+    avoided_ids: Optional[set[int]] = None,
 ) -> dict[str, Any]:
     """包装菜品及其分数、稳定排序值。"""
     dish_id: int = int(dish.get("id", 0))
     return {
         "dish": dish,
-        "_score": _score_dish(dish, constraints, rule, region, meal_key, target_date, rotation_seed),
+        "_score": _score_dish(dish, constraints, rule, region, meal_key, target_date, rotation_seed, avoided_ids),
         "id": dish_id,
         "_rank": _daily_tiebreaker(target_date, dish_id, meal_key, rotation_seed),
     }
@@ -351,6 +364,7 @@ def _candidate_pool(
     target_date: date,
     count: int,
     rotation_seed: int = 0,
+    avoided_ids: Optional[set[int]] = None,
 ) -> list[dict[str, Any]]:
     """构建严格优先、候选不足时放宽年龄/健康约束的候选池。"""
     strict_pool: list[dict[str, Any]] = []
@@ -360,11 +374,11 @@ def _candidate_pool(
             continue
         if not _hard_eliminate(dish, constraints, veg_map, strict=False):
             relaxed_pool.append(
-                _to_scored_candidate(dish, constraints, rule, region, meal_key, target_date, rotation_seed)
+                _to_scored_candidate(dish, constraints, rule, region, meal_key, target_date, rotation_seed, avoided_ids)
             )
         if not _hard_eliminate(dish, constraints, veg_map, strict=True):
             strict_pool.append(
-                _to_scored_candidate(dish, constraints, rule, region, meal_key, target_date, rotation_seed)
+                _to_scored_candidate(dish, constraints, rule, region, meal_key, target_date, rotation_seed, avoided_ids)
             )
 
     if len(strict_pool) >= count:
@@ -474,6 +488,48 @@ def generate_daily_meals(
         structure: dict[int, int] = config.get_meal_structure(headcount, banquet=banquet)[meal_key]
         selected_staple: Optional[dict[str, Any]] = None
 
+        # 早餐按结构表逐类填充：优先 dish_type=5 早餐专用菜谱（包子/稀饭/豆浆/
+        # 凉拌小菜等），再按结构补素菜(type=2)等。候选不足时仅放宽「避免集」
+        # （重配）回退，不重复已选，也绝不引入重油重辣主菜。
+        if meal_key == "breakfast":
+            for dish_type, count in structure.items():
+                if count <= 0:
+                    continue
+                candidates: list[dict[str, Any]] = [
+                    dish for dish in all_dishes if int(dish.get("dish_type", 0)) == dish_type
+                ]
+                pool: list[dict[str, Any]] = _candidate_pool(
+                    candidates,
+                    constraints,
+                    vegetarian_map,
+                    rule,
+                    region,
+                    meal_key,
+                    d,
+                    count,
+                    rotation_seed,
+                    avoided_ids,
+                )
+                selected: list[dict[str, Any]] = _select(
+                    pool,
+                    count,
+                    selected=meals_result[meal_key],
+                    excluded_ids=selected_day_ids | avoided_ids,
+                )
+                # 仅靠「避免集」回退补位：候选确实不足时，不再排除重配菜单，
+                # 但仍排除同日已选的菜，避免早午晚跨餐重复。
+                if len(selected) < count and avoided_ids:
+                    selected += _select(
+                        pool,
+                        count - len(selected),
+                        selected=meals_result[meal_key] + selected,
+                        excluded_ids=selected_day_ids,
+                    )
+                meals_result[meal_key].extend(selected)
+                selected_day_ids.update(int(dish.get("id", 0)) for dish in selected)
+            continue  # 早餐处理完毕，跳过标准逻辑
+
+        # 午晚餐使用标准逻辑
         for dish_type in (1, 2, 3, 4):
             count: int = int(structure.get(dish_type, 0))
             if dish_type != 1:
@@ -481,6 +537,7 @@ def generate_daily_meals(
                 count = int(structure.get(dish_type, 0))
             if count <= 0:
                 continue
+
             candidates: list[dict[str, Any]] = [
                 dish for dish in all_dishes if int(dish.get("dish_type", 0)) == dish_type
             ]
@@ -494,11 +551,11 @@ def generate_daily_meals(
                 d,
                 count,
                 rotation_seed,
+                avoided_ids,
             )
             if dish_type == 1:
                 pool = _prefer_lunch_dinner_staples(pool, meal_key)
-            # 默认严格排除同日已选菜与上次菜单；候选不足时仅允许复用上次菜单，
-            # 绝不允许复用本次已选菜，从而保持跨餐去重。
+
             excluded_ids: set[int] = selected_day_ids | avoided_ids
             selected: list[dict[str, Any]] = _select(
                 pool,
