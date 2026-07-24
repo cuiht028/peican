@@ -587,7 +587,7 @@ class TestMealPlanner(BaseDBTest):
         self.assertLess(len(first_ids & second_ids), len(first_ids))
 
     def test_breakfast_prefers_porridge_and_small_dish(self) -> None:
-        """早餐候选充足时优先粥类主食和小菜/凉菜。"""
+        """早餐候选充足时优先粥类主食和小菜/凉菜/清炒菜。"""
         plan = build_today_plan([self._normal_member()])
         result = generate_daily_meals(date(2024, 6, 21), 1, plan)
         breakfast = result["meals"]["breakfast"]
@@ -595,7 +595,11 @@ class TestMealPlanner(BaseDBTest):
 
         self.assertTrue(any("粥" in name or "羹" in name for name in names))
         self.assertTrue(
-            any("凉拌" in name or "豆花" in name or "小菜" in name for name in names)
+            any(
+                "凉拌" in name or "豆花" in name or "小菜" in name
+                or "拌" in name or "炒" in name or "灼" in name or "蒜" in name
+                for name in names
+            )
         )
 
     def test_lunch_and_dinner_prioritize_solar_term_dishes(self) -> None:

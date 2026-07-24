@@ -37,7 +37,13 @@ _BREAKFAST_PORRIDGE_TOKENS: tuple[str, ...] = ("粥", "羹", "豆花")
 _BREAKFAST_GRAIN_TOKENS: tuple[str, ...] = (
     "粗粮", "小米", "玉米", "荞麦", "高粱", "红薯", "紫米", "薏米",
 )
-_BREAKFAST_SMALL_DISH_TOKENS: tuple[str, ...] = ("凉拌", "小菜", "豆腐", "青菜", "白菜")
+_BREAKFAST_SMALL_DISH_TOKENS: tuple[str, ...] = (
+    "凉拌", "拌", "小菜", "豆腐", "青菜", "白菜", "西兰花", "黄瓜",
+    "萝卜", "海带", "莴笋", "土豆", "豆芽", "菠菜", "茄子",
+)
+_BREAKFAST_WOK_TOKENS: tuple[str, ...] = (
+    "清炒", "炒蛋", "炒", "灼", "蒜蓉", "蒜泥", "素炒",
+)
 _AROMATIC_INGREDIENTS: set[str] = {
     "葱", "大蒜", "蒜", "生姜", "花椒", "红辣椒", "干辣椒", "泡椒",
     "酱油", "醋", "白糖", "郫县豆瓣", "辣椒油", "盐",
@@ -187,19 +193,28 @@ def _history_penalty(dish_id: int, target_date: date) -> int:
 
 
 def _breakfast_preference_bonus(dish: dict[str, Any]) -> int:
-    """为粥、粗粮及凉菜/小菜计算早餐优先级加分。"""
+    """为粥、粗粮及凉菜/小菜计算早餐优先级加分。
+
+    粥/羹/豆花和粗粮仅在 dish_type=5（早餐专用主品）时生效，避免
+    type=2 素菜（如豆花）过度抢占素菜槽位。
+    """
     dish_name: str = str(dish.get("dish_name", ""))
+    dish_type: int = int(dish.get("dish_type", 0))
     ingredient_names: set[str] = _ingredient_names(dish)
     bonus: int = 0
-    if any(token in dish_name for token in _BREAKFAST_PORRIDGE_TOKENS):
-        bonus += 18
-    if any(token in dish_name for token in _BREAKFAST_GRAIN_TOKENS):
-        bonus += 12
+    # 粥/粗粮优先仅适用于早餐专用主品（type=5），素菜槽位不参与竞争。
+    if dish_type == 5:
+        if any(token in dish_name for token in _BREAKFAST_PORRIDGE_TOKENS):
+            bonus += 18
+        if any(token in dish_name for token in _BREAKFAST_GRAIN_TOKENS):
+            bonus += 12
+    if any(token in dish_name for token in _BREAKFAST_WOK_TOKENS):
+        bonus += 8  # 热炒/清炒类家常早餐蔬菜，低于粥(18)但可竞争
     if any(token in dish_name for token in _BREAKFAST_SMALL_DISH_TOKENS):
         bonus += 10
     if {"鸡蛋", "豆腐", "豆干", "黄豆"} & ingredient_names:
         bonus += 5
-    if int(dish.get("dish_type", 2)) == 4:
+    if dish_type == 4:
         bonus += 3
     return bonus
 
