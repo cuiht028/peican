@@ -419,20 +419,18 @@ class TestMealPlanner(BaseDBTest):
         )
 
     def test_three_meal_structure(self) -> None:
-        """V1.1: 1人用餐按 (1,2) 人数段查表。"""
+        """V1.2: 1人用餐按 (1,2) 人数段查表。
+
+        早餐: type=5×2 + type=2×1 = 3道（粥/饼 + 小菜）
+        """
         plan = build_today_plan([self._normal_member()])
         result = generate_daily_meals(date(2024, 6, 21), 1, plan)
         meals = result["meals"]
 
-        # 1人 → DISH_COUNT_BY_HEADCOUNT[(1,2)]
-        # 早餐主食可以是 type=1 或 type=5（早餐专用）
         breakfast_types = self._count_types(meals["breakfast"])
-        self.assertEqual(len(meals["breakfast"]), 2, "早餐应有两道菜")
-        self.assertTrue(
-            (breakfast_types.get(1) == 1 and breakfast_types.get(2) == 1) or
-            (breakfast_types.get(5) == 1 and breakfast_types.get(2) == 1),
-            "早餐应是主食+素菜（主食可为type=1或type=5）"
-        )
+        self.assertEqual(len(meals["breakfast"]), 3, "早餐应有三道菜")
+        self.assertEqual(breakfast_types.get(5), 2, "早餐应有两道早餐主品(type=5)")
+        self.assertEqual(breakfast_types.get(2), 1, "早餐应有一道小菜(type=2)")
         self.assertEqual(
             self._count_types(meals["lunch"]),
             {1: 1, 2: 1, 3: 1},
@@ -507,21 +505,19 @@ class TestMealPlanner(BaseDBTest):
         self.assertEqual(r1, r2)
 
     def test_structure_holds_across_dates(self) -> None:
-        """V1.1: 1人用餐结构在不同日期一致。"""
+        """V1.2: 1人用餐结构在不同日期一致。
+        
+        早餐: type=5×2 (粥/饼) + type=2×1 (小菜) = 3道
+        """
         plan = build_today_plan([self._normal_member()])
         for d in (date(2024, 6, 21), date(2024, 12, 22), date(2024, 2, 4)):
             with self.subTest(date=d.isoformat()):
                 result = generate_daily_meals(d, 1, plan)
                 meals = result["meals"]
-                # 1人 → DISH_COUNT_BY_HEADCOUNT[(1,2)]
-                # 早餐主食可以是 type=1 或 type=5（早餐专用）
                 breakfast_types = self._count_types(meals["breakfast"])
-                self.assertEqual(len(meals["breakfast"]), 2, "早餐应有两道菜")
-                self.assertTrue(
-                    (breakfast_types.get(1) == 1 and breakfast_types.get(2) == 1) or
-                    (breakfast_types.get(5) == 1 and breakfast_types.get(2) == 1),
-                    "早餐应是主食+素菜（主食可为type=1或type=5）"
-                )
+                self.assertEqual(len(meals["breakfast"]), 3, "早餐应有三道菜")
+                self.assertEqual(breakfast_types.get(5), 2, "早餐应有两道早餐主品(type=5)")
+                self.assertEqual(breakfast_types.get(2), 1, "早餐应有一道小菜(type=2)")
                 self.assertEqual(
                     self._count_types(meals["lunch"]),
                     {1: 1, 2: 1, 3: 1},
@@ -967,15 +963,14 @@ class TestGetMealStructure(unittest.TestCase):
                                  f"0人时 {meal}[{dt}] 应为 0")
 
     def test_total_dish_counts_match_spec(self) -> None:
-        """V1.1 规格（早餐改用 type=5 轻量结构，共 2 道）：
-        1-2人7道 / 3-4人9道 / 5-6人11道 / ≥7人13道。
-        统计含 dish_type=1..5 全部键。
+        """V1.2 规格（早餐改用 type=5×2 + 素菜1，共 3 道）：
+        1-2人8道 / 3-4人10道 / 5-6人12道 / ≥7人14道。
         """
         expected_totals = {
-            1: 7, 2: 7,
-            3: 9, 4: 9,
-            5: 11, 6: 11,
-            7: 13, 10: 13,
+            1: 8, 2: 8,
+            3: 10, 4: 10,
+            5: 12, 6: 12,
+            7: 14, 10: 14,
         }
         for headcount, expected_total in expected_totals.items():
             with self.subTest(headcount=headcount):
