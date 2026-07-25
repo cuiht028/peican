@@ -963,14 +963,14 @@ class TestGetMealStructure(unittest.TestCase):
                                  f"0人时 {meal}[{dt}] 应为 0")
 
     def test_total_dish_counts_match_spec(self) -> None:
-        """V1.2 规格（早餐改用 type=5×2 + 素菜1，共 3 道）：
-        1-2人8道 / 3-4人10道 / 5-6人12道 / ≥7人14道。
+        """V1.3 规格（早餐小菜人数分段：1-4人1道，5人及以上2道）：
+        1-4人7+1=8道 / 5人及以上8+1=9道。
         """
         expected_totals = {
             1: 8, 2: 8,
             3: 10, 4: 10,
-            5: 12, 6: 12,
-            7: 14, 10: 14,
+            5: 13, 6: 13,
+            7: 15, 10: 15,
         }
         for headcount, expected_total in expected_totals.items():
             with self.subTest(headcount=headcount):
