@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 import hashlib
+import random
 from typing import Any, Optional
 
 from app import config
@@ -33,17 +34,73 @@ _BREAKFAST_HEAVY_TOKENS: tuple[str, ...] = (
 _BREAKFAST_EXCLUDE_NAMES: tuple[str, ...] = (
     "豆花饭", "皮蛋拌豆腐", "凉拌猪耳朵",
 )
+
+# 早餐粥/羹/豆花优先（仅 type=5 早餐主品生效）
 _BREAKFAST_PORRIDGE_TOKENS: tuple[str, ...] = ("粥", "羹", "豆花")
+
+# 早餐饼类优先（type=5 优先）
+_BREAKFAST_PANCAKE_TOKENS: tuple[str, ...] = (
+    "饼", "锅贴", "卷饼", "锅盔", "煎饼", "煎包", "小笼", "包子", "馒头",
+    "豆浆", "稀饭", "糍",
+)
+
+# 早餐粗粮
 _BREAKFAST_GRAIN_TOKENS: tuple[str, ...] = (
     "粗粮", "小米", "玉米", "荞麦", "高粱", "红薯", "紫米", "薏米",
 )
+
+# 早餐下粥小菜（凉拌/腌制/小菜），优先级高于热炒蔬菜
 _BREAKFAST_SMALL_DISH_TOKENS: tuple[str, ...] = (
-    "凉拌", "拌", "小菜", "豆腐", "青菜", "白菜", "西兰花", "黄瓜",
-    "萝卜", "海带", "莴笋", "土豆", "豆芽", "菠菜", "茄子",
+    "凉拌", "拌", "小菜", "萝卜干", "泡菜", "酱", "花生",
+    "炝拌", "糖醋", "麻辣萝卜", "拌黄瓜", "拌豆腐", "拌海带",
+    "拌莴笋", "拌土豆", "拌藕",
 )
+
+# 早餐热炒蔬菜（优先级较低，仅在无小菜时补位）
 _BREAKFAST_WOK_TOKENS: tuple[str, ...] = (
     "清炒", "炒蛋", "炒", "灼", "蒜蓉", "蒜泥", "素炒",
 )
+
+# 早餐饼类加分（type=5 专用主品）
+_BREAKFAST_PANCAKE_BONUS: int = 16
+
+# 早下粥小菜加分（type=2 素菜槽位）
+_BREAKFAST_SMALL_DISH_BONUS: int = 20
+
+# 早餐热炒加分（type=2 素菜槽位，仅补位）
+_BREAKFAST_WOK_BONUS: int = 5
+
+# 早餐稀饭/羹加分（type=5）
+_BREAKFAST_PORRIDGE_BONUS: int = 22
+
+# 早餐粗粮加分（type=5）
+_BREAKFAST_GRAIN_BONUS: int = 14
+
+# 早餐鸡蛋/豆腐/豆干加分（通用）
+_BREAKFAST_PROTEIN_BONUS: int = 6
+
+# 餐次间轮换随机种子，基于日期 + rotation_seed 生成
+_ROTATION_RANDOM: random.Random = random.Random()
+
+# 温度随机化噪声幅度（0-1），影响同分候选排序的随机性
+_SCORE_NOISE_FACTOR: float = 0.3
+
+# 节气与季节对应（用于菜品 `suit_solar` 批量匹配）
+_SOLAR_BY_SEASON: dict[str, list[str]] = {
+    "春": ["立春", "雨水", "惊蛰", "春分", "清明", "谷雨"],
+    "夏": ["立夏", "小满", "芒种", "夏至", "小暑", "大暑"],
+    "秋": ["立秋", "处暑", "白露", "秋分", "寒露", "霜降"],
+    "冬": ["立冬", "小雪", "大雪", "冬至", "小寒", "大寒"],
+}
+
+# 菜品名中的季节关键词 → 对应节气
+_SEASON_KEYWORDS: dict[str, list[str]] = {
+    "春": ["韭菜", "荠菜", "春笋", "香椿", "豆苗", "蚕豆"],
+    "夏": ["苦瓜", "冬瓜", "丝瓜", "黄瓜", "绿豆", "莲子", "西瓜", "荷叶"],
+    "秋": ["梨", "银耳", "百合", "莲藕", "银耳", "南瓜", "板栗", "柿子"],
+    "冬": ["羊肉", "萝卜", "白菜", "山药", "红薯", "土豆", "洋葱"],
+}
+
 _AROMATIC_INGREDIENTS: set[str] = {
     "葱", "大蒜", "蒜", "生姜", "花椒", "红辣椒", "干辣椒", "泡椒",
     "酱油", "醋", "白糖", "郫县豆瓣", "辣椒油", "盐",
@@ -193,27 +250,38 @@ def _history_penalty(dish_id: int, target_date: date) -> int:
 
 
 def _breakfast_preference_bonus(dish: dict[str, Any]) -> int:
-    """为粥、粗粮及凉菜/小菜计算早餐优先级加分。
+    """为粥、饼类及下粥小菜计算早餐优先级加分。
 
-    粥/羹/豆花和粗粮仅在 dish_type=5（早餐专用主品）时生效，避免
-    type=2 素菜（如豆花）过度抢占素菜槽位。
+    分层优先级：
+    1. 稀饭/粥/羹/豆花（type=5 主品）：最高
+    2. 饼类/包子/馒头/豆浆（type=5 主品）：次高
+    3. 粗粮粥（type=5 主品）：中等
+    4. 下粥小菜（type=2 素菜槽）：高
+    5. 热炒蔬菜（type=2 素菜槽，补位）：低
     """
     dish_name: str = str(dish.get("dish_name", ""))
     dish_type: int = int(dish.get("dish_type", 0))
     ingredient_names: set[str] = _ingredient_names(dish)
     bonus: int = 0
-    # 粥/粗粮优先仅适用于早餐专用主品（type=5），素菜槽位不参与竞争。
+
+    # type=5 早餐主品槽位
     if dish_type == 5:
         if any(token in dish_name for token in _BREAKFAST_PORRIDGE_TOKENS):
-            bonus += 18
+            bonus += _BREAKFAST_PORRIDGE_BONUS  # 粥/羹/豆花：最高
+        if any(token in dish_name for token in _BREAKFAST_PANCAKE_TOKENS):
+            bonus += _BREAKFAST_PANCAKE_BONUS  # 饼类/包子/馒头/豆浆
         if any(token in dish_name for token in _BREAKFAST_GRAIN_TOKENS):
-            bonus += 12
-    if any(token in dish_name for token in _BREAKFAST_WOK_TOKENS):
-        bonus += 8  # 热炒/清炒类家常早餐蔬菜，低于粥(18)但可竞争
-    if any(token in dish_name for token in _BREAKFAST_SMALL_DISH_TOKENS):
-        bonus += 10
+            bonus += _BREAKFAST_GRAIN_BONUS  # 粗粮
+
+    # type=2 素菜槽位：优先下粥小菜，其次热炒
+    elif dish_type == 2:
+        if any(token in dish_name for token in _BREAKFAST_SMALL_DISH_TOKENS):
+            bonus += _BREAKFAST_SMALL_DISH_BONUS
+        if any(token in dish_name for token in _BREAKFAST_WOK_TOKENS):
+            bonus += _BREAKFAST_WOK_BONUS
+
     if {"鸡蛋", "豆腐", "豆干", "黄豆"} & ingredient_names:
-        bonus += 5
+        bonus += _BREAKFAST_PROTEIN_BONUS
     if dish_type == 4:
         bonus += 3
     return bonus
@@ -229,21 +297,31 @@ def _score_dish(
     rotation_seed: int = 0,
     avoided_ids: Optional[set[int]] = None,
 ) -> int:
-    """计算菜品综合分，分数越高优先级越高。"""
+    """计算菜品综合分，分数越高优先级越高。
+
+    新增特性：
+    - 温度随机化：在评分后加入基于日期的随机噪声，让同分菜品有轮换空间
+    - 节气匹配增强：根据菜品主材关键词自动推断季节适配
+    """
     score: int = 0
     taste: dict[str, Any] = dish.get("taste", {}) or {}
     suit_health: set[str] = set(dish.get("suit_health", []) or [])
     suit_age: set[int] = set(dish.get("suit_age", []) or [])
     ingredient_names: set[str] = _ingredient_names(dish)
+    dish_name: str = str(dish.get("dish_name", ""))
 
+    # 健康适配
     score += min(len(constraints["health_needs"] & suit_health) * 3, 9)
     score += min(len(constraints["present_ages"] & suit_age) * 2, 8)
+
+    # 口味匹配
     taste_distance: int = sum(
         abs(int(taste.get(dimension, 2)) - constraints["taste_target"][dimension])
         for dimension in config.TASTE_DIMS
     )
     score += max(0, 16 - taste_distance)
 
+    # 地域偏好
     if int(dish.get("region_type", 2)) == region:
         score += 5
     elif int(dish.get("region_type", 2)) == 2:
@@ -251,14 +329,29 @@ def _score_dish(
     else:
         score -= 3
 
+    # 节气匹配：显式 suit_solar + 关键词推断
     solar_term: str = str(rule.get("solar_term", ""))
-    is_solar_match: bool = solar_term in (dish.get("suit_solar", []) or [])
-    if is_solar_match:
-        # 午晚餐优先消化当令菜，早餐保留更强的粥/粗粮偏好。
-        score += 15 if meal_key in ("lunch", "dinner") else 5
-    recommended_food: set[str] = set(rule.get("recommend_food", []) or [])
-    score += min(len(ingredient_names & recommended_food) * 2, 6)
+    explicit_solar: list[str] = dish.get("suit_solar", []) or []
+    is_solar_match: bool = solar_term in explicit_solar
+    if not is_solar_match:
+        # 根据主材关键词推断季节适配
+        inferred_season: Optional[str] = None
+        for season, keywords in _SEASON_KEYWORDS.items():
+            if any(kw in ingredient_names for kw in keywords):
+                inferred_season = season
+                break
+        if inferred_season and solar_term in _SOLAR_BY_SEASON.get(inferred_season, []):
+            is_solar_match = True
 
+    if is_solar_match:
+        # 午晚餐节气加分更高，早餐保持粥/饼优先级
+        score += 12 if meal_key in ("lunch", "dinner") else 5
+
+    # 推荐食材加分
+    recommended_food: set[str] = set(rule.get("recommend_food", []) or [])
+    score += min(len(ingredient_names & recommended_food) * 3, 9)
+
+    # 忌口降权
     if "香辛类" in constraints["avoid_categories"]:
         if int(taste.get("spicy", 2)) >= 3 or int(taste.get("numb", 2)) >= 3:
             score -= 2
@@ -266,6 +359,7 @@ def _score_dish(
         if int(taste.get("salt", 2)) >= 3 or int(taste.get("sweet", 2)) >= 3:
             score -= 2
 
+    # 餐次特定加分
     if meal_key == "breakfast":
         score += _breakfast_preference_bonus(dish)
         if "婴幼儿软烂" in suit_health or "老人养胃" in suit_health:
@@ -276,16 +370,54 @@ def _score_dish(
         if int(taste.get("spicy", 2)) <= 2:
             score += 1
 
+    # 历史重复惩罚
     dish_id: int = int(dish.get("id", 0))
     score -= _history_penalty(dish_id, target_date)
 
-    # 重新配餐时，对上次菜单中的菜品大幅降权，确保明显变化
+    # 重配降权
     if avoided_ids and dish_id in avoided_ids:
         score -= 50
 
-    # 日期/轮换 seed 只用于同分候选的稳定排序，绝不覆盖健康和节气权重。
-    del rotation_seed
     return score
+
+
+def _apply_rotation_noise(
+    candidates: list[dict[str, Any]],
+    target_date: date,
+    meal_key: str,
+    rotation_seed: int = 0,
+) -> list[dict[str, Any]]:
+    """为候选池添加温度随机化噪声，实现菜品轮换。
+
+    使用基于日期、餐次和 rotation_seed 的确定性随机，确保：
+    1. 同一日期同一餐次的结果稳定可复现
+    2. 不同日期之间有明显变化
+    3. 高分菜品不会永远占据首位
+    """
+    # 确定性随机种子
+    rng = random.Random()
+    rng.seed(f"{target_date.isoformat()}:{meal_key}:{rotation_seed}")
+
+    # 找出最高分作为基准
+    scores = [int(c["_score"]) for c in candidates]
+    if not scores:
+        return candidates
+    max_score = max(scores)
+    min_score = min(scores)
+    spread = max(1, max_score - min_score)
+
+    # 对非最高分的菜品施加噪声，让同分/接近同分的菜品有机会轮换
+    for candidate in candidates:
+        current = int(candidate["_score"])
+        if current < max_score:
+            # 分数差距越小，噪声影响越大（同分菜几乎完全随机排列）
+            distance_from_top = (max_score - current) / spread
+            noise_amplitude = spread * _SCORE_NOISE_FACTOR * (1 - distance_from_top)
+            # 为每个菜品生成不同的噪声值
+            noise = rng.gauss(0, noise_amplitude)
+            candidate["_score"] = current + int(noise)
+
+    return candidates
 
 
 def _to_scored_candidate(
@@ -397,9 +529,11 @@ def _candidate_pool(
             )
 
     if len(strict_pool) >= count:
-        return strict_pool
+        # 候选充足：加入温度噪声实现轮换
+        return _apply_rotation_noise(strict_pool, target_date, meal_key, rotation_seed)
     strict_ids: set[int] = {int(item["id"]) for item in strict_pool}
-    return strict_pool + [item for item in relaxed_pool if int(item["id"]) not in strict_ids]
+    pool = strict_pool + [item for item in relaxed_pool if int(item["id"]) not in strict_ids]
+    return _apply_rotation_noise(pool, target_date, meal_key, rotation_seed)
 
 
 def _is_noodle_staple(dish: dict[str, Any]) -> bool:
